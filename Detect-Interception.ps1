@@ -8,10 +8,10 @@
     against expected values to detect if traffic is being intercepted by a proxy performing 
     SSL/TLS inspection.
     
-    Can be run in command-line mode with switches, or launch a GUI for interactive use.
+    Runs the graphical user interface by default. Use -NoGUI with other switches for command-line mode.
 
-.PARAMETER GUI
-    Launches the graphical user interface for interactive testing
+.PARAMETER NoGUI
+    Suppresses the graphical user interface and runs in command-line mode
 
 .PARAMETER TestAVD
     Tests Azure Virtual Desktop specific endpoints (RDP Gateway, Broker, Diagnostics)
@@ -38,20 +38,20 @@
     Path to save the results file. Default is current directory.
 
 .EXAMPLE
-    .\Detect-SSLInterception-Combined.ps1 -GUI
-    Launches the graphical user interface
+    .\Detect-Interception.ps1
+    Launches the graphical user interface (default behavior)
 
 .EXAMPLE
-    .\Detect-SSLInterception-Combined.ps1 -TestAVD
-    Tests only AVD-related endpoints via command line
+    .\Detect-Interception.ps1 -NoGUI -TestAVD
+    Tests only AVD-related endpoints via command line without GUI
 
 .EXAMPLE
-    .\Detect-SSLInterception-Combined.ps1 -TestAll -OutputPath "C:\Logs"
+    .\Detect-Interception.ps1 -NoGUI -TestAll -OutputPath "C:\Logs"
     Tests all endpoints and saves results to C:\Logs
 
 .EXAMPLE
-    .\Detect-SSLInterception-Combined.ps1 -CustomEndpoints @("myapp.contoso.com:443")
-    Tests custom endpoints
+    .\Detect-Interception.ps1 -NoGUI -CustomEndpoints @("myapp.contoso.com:443")
+    Tests custom endpoints via command line
 
 .NOTES
     Author: AVD Diagnostics Team
@@ -61,7 +61,7 @@
 
 [CmdletBinding()]
 param(
-    [switch]$GUI,
+    [switch]$NoGUI,
     [switch]$TestAVD,
     [switch]$TestMicrosoft365,
     [switch]$TestAzure,
@@ -1783,40 +1783,40 @@ function Start-CLIMode {
 #region Main Entry Point
 
 # Determine which mode to run
-if ($GUI) {
-    Start-GUIMode
-}
-elseif ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
-    Start-CLIMode
+if ($NoGUI) {
+    # NoGUI specified - run in CLI mode if tests are specified, otherwise show help
+    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
+        Start-CLIMode
+    }
+    else {
+        Write-Host ""
+        Write-Host "SSL/TLS Interception Detector" -ForegroundColor Cyan
+        Write-Host "=============================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "Usage:" -ForegroundColor Yellow
+        Write-Host "  (no switches)        Launch graphical user interface (default)"
+        Write-Host "  -NoGUI               Suppress GUI and use command-line mode"
+        Write-Host "  -TestAVD             Test Azure Virtual Desktop endpoints"
+        Write-Host "  -TestMicrosoft365    Test Microsoft 365 endpoints"
+        Write-Host "  -TestAzure           Test Azure service endpoints"
+        Write-Host "  -TestAll             Test all endpoint categories"
+        Write-Host "  -FetchM365Endpoints  Fetch live M365 endpoints from Microsoft"
+        Write-Host "  -FetchAzureEndpoints Fetch live Azure endpoints from Microsoft"
+        Write-Host "  -CustomEndpoints     Test custom endpoints (e.g., @('host:port'))"
+        Write-Host "  -OutputPath          Path to save results (default: current directory)"
+        Write-Host ""
+        Write-Host "Examples:" -ForegroundColor Yellow
+        Write-Host "  .\Detect-Interception.ps1"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAll"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -FetchM365Endpoints"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAVD -FetchAzureEndpoints"
+        Write-Host ""
+        Write-Host "Note: -NoGUI requires at least one test parameter to be specified." -ForegroundColor Yellow
+    }
 }
 else {
-    # No parameters - show help and offer to launch GUI
-    Write-Host ""
-    Write-Host "SSL/TLS Interception Detector" -ForegroundColor Cyan
-    Write-Host "=============================" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "Usage:" -ForegroundColor Yellow
-    Write-Host "  -GUI                 Launch graphical user interface"
-    Write-Host "  -TestAVD             Test Azure Virtual Desktop endpoints"
-    Write-Host "  -TestMicrosoft365    Test Microsoft 365 endpoints"
-    Write-Host "  -TestAzure           Test Azure service endpoints"
-    Write-Host "  -TestAll             Test all endpoint categories"
-    Write-Host "  -FetchM365Endpoints  Fetch live M365 endpoints from Microsoft"
-    Write-Host "  -FetchAzureEndpoints Fetch live Azure endpoints from Microsoft"
-    Write-Host "  -CustomEndpoints     Test custom endpoints (e.g., @('host:port'))"
-    Write-Host "  -OutputPath          Path to save results (default: current directory)"
-    Write-Host ""
-    Write-Host "Examples:" -ForegroundColor Yellow
-    Write-Host "  .\Detect-Interception.ps1 -GUI"
-    Write-Host "  .\Detect-Interception.ps1 -TestAll"
-    Write-Host "  .\Detect-Interception.ps1 -FetchM365Endpoints"
-    Write-Host "  .\Detect-Interception.ps1 -TestAVD -FetchAzureEndpoints"
-    Write-Host ""
-    
-    $response = Read-Host "Would you like to launch the GUI? (Y/N)"
-    if ($response -match '^[Yy]') {
-        Start-GUIMode
-    }
+    # Default behavior - launch GUI
+    Start-GUIMode
 }
 
 #endregion
