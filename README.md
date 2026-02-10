@@ -13,6 +13,7 @@ This script tests endpoints commonly used by Azure Virtual Desktop (AVD), Micros
   - Azure Virtual Desktop (RDP Gateway, Broker, Diagnostics, KMS)
   - Microsoft 365 (Outlook, Teams, SharePoint, OneDrive, Graph API)
   - Azure (Entra ID, Management API, Key Vault, Blob Storage, SQL)
+  - Tenant Restriction v2 / Global Secure Access (Device Registration, Seamless SSO, GSA Tunnel)
 - **Live endpoint fetching** - Pull current M365 and Azure endpoint lists from official Microsoft JSON feeds
 - **Custom endpoint testing** - Test your own endpoints
 - **Certificate chain analysis** - Full certificate chain inspection with thumbprint verification
@@ -40,6 +41,9 @@ Use the `-NoGUI` switch to run in command-line mode:
 
 # Test Azure endpoints
 .\Detect-Interception.ps1 -NoGUI -TestAzure
+
+# Test TRv2 / Global Secure Access endpoints
+.\Detect-Interception.ps1 -NoGUI -TestTRv2
 
 # Test all categories
 .\Detect-Interception.ps1 -NoGUI -TestAll
@@ -86,6 +90,7 @@ Discovered CAs are:
 | `-TestAVD` | Test Azure Virtual Desktop endpoints |
 | `-TestMicrosoft365` | Test Microsoft 365 endpoints |
 | `-TestAzure` | Test Azure service endpoints |
+| `-TestTRv2` | Test Tenant Restriction v2 / Global Secure Access endpoints |
 | `-TestAll` | Test all endpoint categories |
 | `-FetchM365Endpoints` | Fetch live M365 endpoints from Microsoft |
 | `-FetchAzureEndpoints` | Fetch live Azure endpoints from Microsoft |

@@ -22,6 +22,9 @@
 .PARAMETER TestAzure
     Tests Azure management and authentication endpoints (Azure AD, Graph API, Management)
 
+.PARAMETER TestTRv2
+    Tests Tenant Restriction v2 and Global Secure Access endpoints
+
 .PARAMETER TestAll
     Tests all endpoint categories
 
@@ -82,6 +85,7 @@ param(
     [switch]$TestAVD,
     [switch]$TestMicrosoft365,
     [switch]$TestAzure,
+    [switch]$TestTRv2,
     [switch]$TestAll,
     [switch]$FetchM365Endpoints,
     [switch]$FetchAzureEndpoints,
@@ -160,6 +164,18 @@ $script:AzureEndpoints = @(
     @{ Host = "vault.azure.net"; Port = 443; Description = "Azure Key Vault" }
     @{ Host = "servicebus.windows.net"; Port = 443; Description = "Azure Service Bus" }
     @{ Host = "database.windows.net"; Port = 1433; Description = "Azure SQL" }
+)
+
+$script:TRv2Endpoints = @(
+    @{ Host = "device.login.microsoftonline.com"; Port = 443; Description = "Device Code Flow" }
+    @{ Host = "autologon.microsoftazuread-sso.com"; Port = 443; Description = "Seamless SSO" }
+    @{ Host = "enterpriseregistration.windows.net"; Port = 443; Description = "Device Registration" }
+    @{ Host = "pas.windows.net"; Port = 443; Description = "Azure AD Password Protection" }
+    @{ Host = "passwordreset.microsoftonline.com"; Port = 443; Description = "Self-Service Password Reset" }
+    @{ Host = "*.globalsecureaccess.microsoft.com"; Port = 443; Description = "Global Secure Access" }
+    @{ Host = "tunnel.globalsecureaccess.microsoft.com"; Port = 443; Description = "GSA Tunnel" }
+    @{ Host = "edge.microsoft.com"; Port = 443; Description = "Edge Updates (TRv2)" }
+    @{ Host = "config.edge.skype.com"; Port = 443; Description = "Edge Config" }
 )
 
 # Initialize config path and load additional root CAs if config exists
@@ -880,6 +896,7 @@ function Start-GUIMode {
                                 <CheckBox x:Name="chkAVD" Content="Azure Virtual Desktop" IsChecked="True" Margin="0,5"/>
                                 <CheckBox x:Name="chkM365" Content="Microsoft 365" IsChecked="True" Margin="0,5"/>
                                 <CheckBox x:Name="chkAzure" Content="Azure Services" IsChecked="True" Margin="0,5"/>
+                                <CheckBox x:Name="chkTRv2" Content="TRv2 / Global Secure Access" IsChecked="True" Margin="0,5"/>
                                 <Separator Margin="0,10" Background="#3C3C3C"/>
                                 <Button x:Name="btnSelectAll" Content="Select All" Margin="0,5"/>
                                 <Button x:Name="btnDeselectAll" Content="Deselect All" Margin="0,5" Background="#555555"/>
@@ -1141,6 +1158,15 @@ function Start-GUIMode {
         @{ Category = "Azure"; Host = "aadcdn.msftauth.net"; Port = 443; Description = "Azure AD CDN"; Enabled = $true }
         @{ Category = "Azure"; Host = "management.azure.com"; Port = 443; Description = "Azure Management API"; Enabled = $true }
         @{ Category = "Azure"; Host = "management.core.windows.net"; Port = 443; Description = "Azure Classic Management"; Enabled = $true }
+        
+        # TRv2 / Global Secure Access Endpoints
+        @{ Category = "TRv2"; Host = "device.login.microsoftonline.com"; Port = 443; Description = "Device Code Flow"; Enabled = $true }
+        @{ Category = "TRv2"; Host = "autologon.microsoftazuread-sso.com"; Port = 443; Description = "Seamless SSO"; Enabled = $true }
+        @{ Category = "TRv2"; Host = "enterpriseregistration.windows.net"; Port = 443; Description = "Device Registration"; Enabled = $true }
+        @{ Category = "TRv2"; Host = "pas.windows.net"; Port = 443; Description = "Azure AD Password Protection"; Enabled = $true }
+        @{ Category = "TRv2"; Host = "passwordreset.microsoftonline.com"; Port = 443; Description = "Self-Service Password Reset"; Enabled = $true }
+        @{ Category = "TRv2"; Host = "tunnel.globalsecureaccess.microsoft.com"; Port = 443; Description = "GSA Tunnel"; Enabled = $true }
+        @{ Category = "TRv2"; Host = "edge.microsoft.com"; Port = 443; Description = "Edge Updates (TRv2)"; Enabled = $true }
     )
 
     # Load default endpoints
@@ -1247,9 +1273,13 @@ function Start-GUIMode {
         $azureEnabled = $guiEndpointsList | Where-Object { $_.Category -eq "Azure" -and $_.Enabled } | Measure-Object | Select-Object -ExpandProperty Count
         $azureTotal = $guiEndpointsList | Where-Object { $_.Category -eq "Azure" } | Measure-Object | Select-Object -ExpandProperty Count
         
+        $trv2Enabled = $guiEndpointsList | Where-Object { $_.Category -eq "TRv2" -and $_.Enabled } | Measure-Object | Select-Object -ExpandProperty Count
+        $trv2Total = $guiEndpointsList | Where-Object { $_.Category -eq "TRv2" } | Measure-Object | Select-Object -ExpandProperty Count
+        
         $chkAVD.IsChecked = ($avdEnabled -eq $avdTotal -and $avdTotal -gt 0)
         $chkM365.IsChecked = ($m365Enabled -eq $m365Total -and $m365Total -gt 0)
         $chkAzure.IsChecked = ($azureEnabled -eq $azureTotal -and $azureTotal -gt 0)
+        $chkTRv2.IsChecked = ($trv2Enabled -eq $trv2Total -and $trv2Total -gt 0)
     }
 
     function Export-ResultsGUI {
@@ -1335,6 +1365,20 @@ function Start-GUIMode {
     $chkAzure.Add_Unchecked({
         foreach ($ep in $guiEndpointsList) {
             if ($ep.Category -eq "Azure") { $ep.Enabled = $false }
+        }
+        $dgEndpoints.Items.Refresh()
+    })
+
+    $chkTRv2.Add_Checked({
+        foreach ($ep in $guiEndpointsList) {
+            if ($ep.Category -eq "TRv2") { $ep.Enabled = $true }
+        }
+        $dgEndpoints.Items.Refresh()
+    })
+
+    $chkTRv2.Add_Unchecked({
+        foreach ($ep in $guiEndpointsList) {
+            if ($ep.Category -eq "TRv2") { $ep.Enabled = $false }
         }
         $dgEndpoints.Items.Refresh()
     })
@@ -1950,6 +1994,7 @@ function Start-CLIMode {
         $endpointsToTest += $script:AVDEndpoints
         $endpointsToTest += $script:Microsoft365Endpoints
         $endpointsToTest += $script:AzureEndpoints
+        $endpointsToTest += $script:TRv2Endpoints
         Write-ColorOutput "Testing ALL endpoint categories..." "Yellow"
     }
     else {
@@ -1964,6 +2009,10 @@ function Start-CLIMode {
         if ($TestAzure) {
             $endpointsToTest += $script:AzureEndpoints
             Write-ColorOutput "Testing Azure endpoints..." "Yellow"
+        }
+        if ($TestTRv2) {
+            $endpointsToTest += $script:TRv2Endpoints
+            Write-ColorOutput "Testing TRv2 / Global Secure Access endpoints..." "Yellow"
         }
     }
 
@@ -2128,7 +2177,7 @@ if ($DiscoverRootCAs) {
 }
 elseif ($NoGUI) {
     # NoGUI specified - run in CLI mode if tests are specified, otherwise show help
-    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
+    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
         Start-CLIMode
     }
     else {
@@ -2142,6 +2191,7 @@ elseif ($NoGUI) {
         Write-Host "  -TestAVD             Test Azure Virtual Desktop endpoints"
         Write-Host "  -TestMicrosoft365    Test Microsoft 365 endpoints"
         Write-Host "  -TestAzure           Test Azure service endpoints"
+        Write-Host "  -TestTRv2            Test Tenant Restriction v2 / Global Secure Access endpoints"
         Write-Host "  -TestAll             Test all endpoint categories"
         Write-Host "  -FetchM365Endpoints  Fetch live M365 endpoints from Microsoft"
         Write-Host "  -FetchAzureEndpoints Fetch live Azure endpoints from Microsoft"
