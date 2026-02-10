@@ -1038,7 +1038,16 @@ function Start-GUIMode {
             <!-- Known CAs Tab -->
             <TabItem Header="Known Root CAs">
                 <Grid Margin="10">
-                    <DataGrid x:Name="dgKnownCAs"
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    
+                    <TextBlock Grid.Row="0" Text="These are the trusted Microsoft root CAs used to detect SSL/TLS interception:" 
+                               Foreground="#AAAAAA" Margin="0,0,0,10"/>
+                    
+                    <DataGrid x:Name="dgKnownCAs" Grid.Row="1"
                               AutoGenerateColumns="False" 
                               CanUserAddRows="False"
                               IsReadOnly="True"
@@ -1046,9 +1055,15 @@ function Start-GUIMode {
                               VerticalScrollBarVisibility="Auto">
                         <DataGrid.Columns>
                             <DataGridTextColumn Header="Root CA Name" Binding="{Binding Name}" Width="350"/>
-                            <DataGridTextColumn Header="Thumbprint" Binding="{Binding Thumbprint}" Width="*"/>
+                            <DataGridTextColumn Header="Thumbprint" Binding="{Binding Thumbprint}" Width="300"/>
+                            <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="*"/>
                         </DataGrid.Columns>
                     </DataGrid>
+                    
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,10,0,0">
+                        <Button x:Name="btnDiscoverCAs" Content="Discover &amp; Update Root CAs" Padding="15,8" Margin="0,0,10,0"/>
+                        <TextBlock x:Name="txtCAStatus" VerticalAlignment="Center" Foreground="#888888" Text=""/>
+                    </StackPanel>
                 </Grid>
             </TabItem>
         </TabControl>
@@ -1142,9 +1157,11 @@ function Start-GUIMode {
 
     # Load known CAs
     foreach ($ca in $script:KnownMicrosoftRootCAs.GetEnumerator()) {
+        $source = if ($script:AdditionalRootCAs.ContainsKey($ca.Key)) { "Config File" } else { "Built-in" }
         $caObj = [PSCustomObject]@{
             Name = $ca.Key
             Thumbprint = $ca.Value
+            Source = $source
         }
         $guiKnownCAsList.Add($caObj)
     }
@@ -1534,6 +1551,89 @@ function Start-GUIMode {
     # Export button
     $btnExport.Add_Click({
         Export-ResultsGUI
+    })
+
+    # Discover Root CAs button
+    $btnDiscoverCAs.Add_Click({
+        $btnDiscoverCAs.IsEnabled = $false
+        $txtCAStatus.Text = "Discovering root CAs..."
+        $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        
+        try {
+            # Get sample of endpoints for scanning
+            $allEndpoints = @()
+            $allEndpoints += $script:AVDEndpoints | Where-Object { $_.Port -eq 443 }
+            $allEndpoints += $script:Microsoft365Endpoints
+            $allEndpoints += $script:AzureEndpoints | Where-Object { $_.Port -eq 443 }
+            $sampleEndpoints = $allEndpoints | Select-Object -First 15
+            
+            $discoveredRootCAs = @{}
+            $scannedCount = 0
+            $successCount = 0
+            
+            foreach ($endpoint in $sampleEndpoints) {
+                $scannedCount++
+                $txtCAStatus.Text = "Scanning [$scannedCount/$($sampleEndpoints.Count)]: $($endpoint.Host)..."
+                $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+                
+                try {
+                    $result = Get-CertificateChain -Hostname $endpoint.Host -Port $endpoint.Port -TimeoutMs 5000
+                    
+                    if ($result.Success -and $result.RootThumbprint) {
+                        $successCount++
+                        $rootName = $result.RootCA -replace '^CN=', '' -replace ',.*$', ''
+                        
+                        if (-not $discoveredRootCAs.ContainsKey($rootName)) {
+                            $discoveredRootCAs[$rootName] = $result.RootThumbprint
+                        }
+                    }
+                }
+                catch { }
+            }
+            
+            # Find new CAs not in current list
+            $newCAsAdded = 0
+            foreach ($ca in $discoveredRootCAs.GetEnumerator()) {
+                if ($script:KnownMicrosoftRootCAs.Values -notcontains $ca.Value) {
+                    # Add to the known list
+                    $script:KnownMicrosoftRootCAs[$ca.Name] = $ca.Value
+                    $script:AdditionalRootCAs[$ca.Name] = $ca.Value
+                    
+                    # Add to GUI list
+                    $caObj = [PSCustomObject]@{
+                        Name = $ca.Name
+                        Thumbprint = $ca.Value
+                        Source = "Discovered"
+                    }
+                    $guiKnownCAsList.Add($caObj)
+                    $newCAsAdded++
+                }
+            }
+            
+            # Save to config file
+            if ($newCAsAdded -gt 0) {
+                try {
+                    $allCAsToSave = @{}
+                    foreach ($ca in $script:AdditionalRootCAs.GetEnumerator()) {
+                        $allCAsToSave[$ca.Name] = $ca.Value
+                    }
+                    $allCAsToSave | ConvertTo-Json -Depth 10 | Set-Content $script:RootCAConfigFile -Encoding UTF8
+                    $txtCAStatus.Text = "Added $newCAsAdded new CA(s). Saved to config file."
+                }
+                catch {
+                    $txtCAStatus.Text = "Added $newCAsAdded new CA(s). Failed to save config: $($_.Exception.Message)"
+                }
+            }
+            else {
+                $txtCAStatus.Text = "Discovery complete. All $($discoveredRootCAs.Count) CAs already in list."
+            }
+        }
+        catch {
+            $txtCAStatus.Text = "Error: $($_.Exception.Message)"
+        }
+        finally {
+            $btnDiscoverCAs.IsEnabled = $true
+        }
     })
 
     # Stop button
