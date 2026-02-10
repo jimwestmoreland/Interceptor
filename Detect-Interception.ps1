@@ -31,6 +31,15 @@
 .PARAMETER FetchAzureEndpoints
     Fetches the current Azure endpoint list from the official Microsoft JSON feed
 
+.PARAMETER DiscoverRootCAs
+    Scans all known Microsoft endpoints to discover root CAs currently in use.
+    Optionally saves them to a config file for future use.
+
+.PARAMETER RootCAConfigPath
+    Path to a JSON file containing additional trusted root CAs.
+    If not specified, looks for 'TrustedRootCAs.json' in the script directory.
+    Use with -DiscoverRootCAs to save discovered CAs to this file.
+
 .PARAMETER CustomEndpoints
     Array of custom endpoints to test (e.g., @("contoso.com:443", "api.example.com:443"))
 
@@ -53,6 +62,14 @@
     .\Detect-Interception.ps1 -NoGUI -CustomEndpoints @("myapp.contoso.com:443")
     Tests custom endpoints via command line
 
+.EXAMPLE
+    .\Detect-Interception.ps1 -NoGUI -DiscoverRootCAs
+    Scans endpoints to discover current Microsoft root CAs and saves to TrustedRootCAs.json
+
+.EXAMPLE
+    .\Detect-Interception.ps1 -NoGUI -DiscoverRootCAs -RootCAConfigPath "C:\Config\MyRootCAs.json"
+    Discovers root CAs and saves to a custom config file path
+
 .NOTES
     Author: AVD Diagnostics Team
     Version: 1.0
@@ -68,6 +85,8 @@ param(
     [switch]$TestAll,
     [switch]$FetchM365Endpoints,
     [switch]$FetchAzureEndpoints,
+    [switch]$DiscoverRootCAs,
+    [string]$RootCAConfigPath,
     [string[]]$CustomEndpoints,
     [string]$OutputPath = $PWD.Path
 )
@@ -142,6 +161,17 @@ $script:AzureEndpoints = @(
     @{ Host = "servicebus.windows.net"; Port = 443; Description = "Azure Service Bus" }
     @{ Host = "database.windows.net"; Port = 1433; Description = "Azure SQL" }
 )
+
+# Initialize config path and load additional root CAs if config exists
+$script:RootCAConfigFile = if ($RootCAConfigPath) { 
+    $RootCAConfigPath 
+} else {
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if ($scriptDir) { Join-Path $scriptDir "TrustedRootCAs.json" } else { "TrustedRootCAs.json" }
+}
+
+# Load additional root CAs from config file if it exists (will be merged after functions are defined)
+$script:AdditionalRootCAs = @{}
 
 #endregion
 
@@ -317,6 +347,196 @@ function Get-AzureEndpointsFromMicrosoft {
     }
     
     return $endpoints
+}
+
+function Get-RootCAConfigPath {
+    <#
+    .SYNOPSIS
+        Gets the path to the root CA config file
+    #>
+    param([string]$CustomPath)
+    
+    if ($CustomPath) {
+        return $CustomPath
+    }
+    
+    # Default to script directory
+    $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
+    if (-not $scriptDir) {
+        $scriptDir = $PWD.Path
+    }
+    return Join-Path $scriptDir "TrustedRootCAs.json"
+}
+
+function Import-RootCAConfig {
+    <#
+    .SYNOPSIS
+        Loads additional trusted root CAs from a JSON config file
+    #>
+    param([string]$ConfigPath)
+    
+    if (-not (Test-Path $ConfigPath)) {
+        return @{}
+    }
+    
+    try {
+        $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        $rootCAs = @{}
+        
+        foreach ($prop in $config.PSObject.Properties) {
+            $rootCAs[$prop.Name] = $prop.Value
+        }
+        
+        Write-Host "Loaded $($rootCAs.Count) additional root CAs from config" -ForegroundColor Green
+        return $rootCAs
+    }
+    catch {
+        Write-Host "Warning: Failed to load root CA config: $($_.Exception.Message)" -ForegroundColor Yellow
+        return @{}
+    }
+}
+
+function Export-RootCAConfig {
+    <#
+    .SYNOPSIS
+        Saves discovered root CAs to a JSON config file
+    #>
+    param(
+        [hashtable]$RootCAs,
+        [string]$ConfigPath
+    )
+    
+    try {
+        $RootCAs | ConvertTo-Json -Depth 10 | Set-Content $ConfigPath -Encoding UTF8
+        Write-Host "Saved $($RootCAs.Count) root CAs to: $ConfigPath" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Error saving root CA config: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Invoke-RootCADiscovery {
+    <#
+    .SYNOPSIS
+        Scans known Microsoft endpoints to discover root CAs currently in use
+    .DESCRIPTION
+        Connects to a sample of known Microsoft/Azure/M365 endpoints, retrieves their
+        certificate chains, and extracts the unique root CAs.
+    #>
+    param(
+        [string]$ConfigPath,
+        [switch]$SaveToConfig
+    )
+    
+    Write-Host ""
+    Write-Host "Root CA Discovery" -ForegroundColor Cyan
+    Write-Host "=================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Scanning Microsoft endpoints to discover current root CAs..." -ForegroundColor Yellow
+    Write-Host ""
+    
+    # Combine all endpoint lists for scanning
+    $allEndpoints = @()
+    $allEndpoints += $script:AVDEndpoints | Where-Object { $_.Port -eq 443 }
+    $allEndpoints += $script:Microsoft365Endpoints
+    $allEndpoints += $script:AzureEndpoints | Where-Object { $_.Port -eq 443 }
+    
+    # Limit to a reasonable sample to avoid too many connections
+    $sampleEndpoints = $allEndpoints | Select-Object -First 20
+    
+    $discoveredRootCAs = @{}
+    $scannedCount = 0
+    $successCount = 0
+    
+    foreach ($endpoint in $sampleEndpoints) {
+        $scannedCount++
+        Write-Host "  [$scannedCount/$($sampleEndpoints.Count)] Checking $($endpoint.Host)..." -NoNewline
+        
+        try {
+            $result = Get-CertificateChain -Hostname $endpoint.Host -Port $endpoint.Port -TimeoutMs 5000
+            
+            if ($result.Success -and $result.RootThumbprint) {
+                $successCount++
+                $rootName = $result.RootCA -replace '^CN=', '' -replace ',.*$', ''
+                
+                if (-not $discoveredRootCAs.ContainsKey($rootName)) {
+                    $discoveredRootCAs[$rootName] = $result.RootThumbprint
+                    Write-Host " Found: $rootName" -ForegroundColor Green
+                }
+                else {
+                    Write-Host " OK (already discovered)" -ForegroundColor DarkGray
+                }
+            }
+            else {
+                Write-Host " Failed: $($result.Error)" -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host " Error: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "Discovery Complete" -ForegroundColor Cyan
+    Write-Host "==================" -ForegroundColor Cyan
+    Write-Host "Scanned: $scannedCount endpoints"
+    Write-Host "Successful: $successCount endpoints"
+    Write-Host "Unique Root CAs Found: $($discoveredRootCAs.Count)"
+    Write-Host ""
+    
+    # Display discovered CAs
+    Write-Host "Discovered Root CAs:" -ForegroundColor Yellow
+    foreach ($ca in $discoveredRootCAs.GetEnumerator() | Sort-Object Name) {
+        $isKnown = $script:KnownMicrosoftRootCAs.Values -contains $ca.Value
+        $status = if ($isKnown) { "[Already in built-in list]" } else { "[NEW]" }
+        $color = if ($isKnown) { "DarkGray" } else { "Green" }
+        Write-Host "  $($ca.Name)" -ForegroundColor $color
+        Write-Host "    Thumbprint: $($ca.Value) $status" -ForegroundColor $color
+    }
+    
+    # Find new CAs not in current list
+    $newCAs = @{}
+    foreach ($ca in $discoveredRootCAs.GetEnumerator()) {
+        if ($script:KnownMicrosoftRootCAs.Values -notcontains $ca.Value) {
+            $newCAs[$ca.Name] = $ca.Value
+        }
+    }
+    
+    if ($newCAs.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Found $($newCAs.Count) NEW root CA(s) not in the built-in list!" -ForegroundColor Yellow
+        
+        if ($SaveToConfig -or $ConfigPath) {
+            # Merge with existing config if present
+            $existingConfig = @{}
+            if ($ConfigPath -and (Test-Path $ConfigPath)) {
+                $existingConfig = Import-RootCAConfig -ConfigPath $ConfigPath
+            }
+            
+            # Merge discovered CAs with existing
+            foreach ($ca in $discoveredRootCAs.GetEnumerator()) {
+                $existingConfig[$ca.Name] = $ca.Value
+            }
+            
+            $savePath = if ($ConfigPath) { $ConfigPath } else { Get-RootCAConfigPath }
+            Export-RootCAConfig -RootCAs $existingConfig -ConfigPath $savePath
+        }
+        else {
+            Write-Host ""
+            Write-Host "To save these root CAs to a config file, run with -DiscoverRootCAs" -ForegroundColor Cyan
+            Write-Host "The config file will be created at: $(Get-RootCAConfigPath)" -ForegroundColor Cyan
+        }
+    }
+    else {
+        Write-Host ""
+        Write-Host "All discovered root CAs are already in the built-in list." -ForegroundColor Green
+    }
+    
+    Write-Host ""
+    
+    return $discoveredRootCAs
 }
 
 #endregion
@@ -1782,8 +2002,31 @@ function Start-CLIMode {
 
 #region Main Entry Point
 
+# Load additional root CAs from config file if it exists
+if (Test-Path $script:RootCAConfigFile) {
+    try {
+        $configContent = Get-Content $script:RootCAConfigFile -Raw | ConvertFrom-Json
+        foreach ($prop in $configContent.PSObject.Properties) {
+            if (-not $script:KnownMicrosoftRootCAs.ContainsKey($prop.Name)) {
+                $script:KnownMicrosoftRootCAs[$prop.Name] = $prop.Value
+                $script:AdditionalRootCAs[$prop.Name] = $prop.Value
+            }
+        }
+        if ($script:AdditionalRootCAs.Count -gt 0) {
+            Write-Host "Loaded $($script:AdditionalRootCAs.Count) additional root CA(s) from config file" -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        Write-Host "Warning: Failed to load root CA config: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 # Determine which mode to run
-if ($NoGUI) {
+if ($DiscoverRootCAs) {
+    # Run root CA discovery mode
+    Invoke-RootCADiscovery -ConfigPath $script:RootCAConfigFile -SaveToConfig
+}
+elseif ($NoGUI) {
     # NoGUI specified - run in CLI mode if tests are specified, otherwise show help
     if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
         Start-CLIMode
@@ -1802,6 +2045,8 @@ if ($NoGUI) {
         Write-Host "  -TestAll             Test all endpoint categories"
         Write-Host "  -FetchM365Endpoints  Fetch live M365 endpoints from Microsoft"
         Write-Host "  -FetchAzureEndpoints Fetch live Azure endpoints from Microsoft"
+        Write-Host "  -DiscoverRootCAs     Discover and save current Microsoft root CAs"
+        Write-Host "  -RootCAConfigPath    Path to custom root CA config file"
         Write-Host "  -CustomEndpoints     Test custom endpoints (e.g., @('host:port'))"
         Write-Host "  -OutputPath          Path to save results (default: current directory)"
         Write-Host ""
@@ -1810,6 +2055,7 @@ if ($NoGUI) {
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAll"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -FetchM365Endpoints"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAVD -FetchAzureEndpoints"
+        Write-Host "  .\Detect-Interception.ps1 -DiscoverRootCAs"
         Write-Host ""
         Write-Host "Note: -NoGUI requires at least one test parameter to be specified." -ForegroundColor Yellow
     }
