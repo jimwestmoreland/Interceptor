@@ -25,9 +25,6 @@
 .PARAMETER TestTRv2
     Tests Tenant Restriction v2 and Global Secure Access endpoints
 
-.PARAMETER TestAppleSSO
-    Tests Apple SSO Extension endpoints (required for Enterprise SSO on macOS/iOS)
-
 .PARAMETER TestAll
     Tests all endpoint categories
 
@@ -89,7 +86,6 @@ param(
     [switch]$TestMicrosoft365,
     [switch]$TestAzure,
     [switch]$TestTRv2,
-    [switch]$TestAppleSSO,
     [switch]$TestAll,
     [switch]$FetchM365Endpoints,
     [switch]$FetchAzureEndpoints,
@@ -180,20 +176,6 @@ $script:TRv2Endpoints = @(
     @{ Host = "tunnel.globalsecureaccess.microsoft.com"; Port = 443; Description = "GSA Tunnel" }
     @{ Host = "edge.microsoft.com"; Port = 443; Description = "Edge Updates (TRv2)" }
     @{ Host = "config.edge.skype.com"; Port = 443; Description = "Edge Config" }
-)
-
-$script:AppleSSOEndpoints = @(
-    @{ Host = "app-site-association.cdn-apple.com"; Port = 443; Description = "Apple Associated Domains CDN" }
-    @{ Host = "app-site-association.networking.apple"; Port = 443; Description = "Apple Associated Domains" }
-    @{ Host = "login.microsoftonline.com"; Port = 443; Description = "Entra ID (SSO Extension)" }
-    @{ Host = "login.microsoft.com"; Port = 443; Description = "Microsoft Login (SSO Extension)" }
-    @{ Host = "login.windows.net"; Port = 443; Description = "Azure AD Legacy (SSO Extension)" }
-    @{ Host = "sts.windows.net"; Port = 443; Description = "Security Token Service" }
-    @{ Host = "login.partner.microsoftonline.cn"; Port = 443; Description = "China Cloud Login" }
-    @{ Host = "login.chinacloudapi.cn"; Port = 443; Description = "China Cloud API" }
-    @{ Host = "login.microsoftonline.us"; Port = 443; Description = "US Gov Cloud Login" }
-    @{ Host = "login.usgovcloudapi.net"; Port = 443; Description = "US Gov Cloud API" }
-    @{ Host = "login-us.microsoftonline.com"; Port = 443; Description = "US Region Login" }
 )
 
 # Initialize config path and load additional root CAs if config exists
@@ -915,7 +897,6 @@ function Start-GUIMode {
                                 <CheckBox x:Name="chkM365" Content="Microsoft 365" IsChecked="True" Margin="0,5"/>
                                 <CheckBox x:Name="chkAzure" Content="Azure Services" IsChecked="True" Margin="0,5"/>
                                 <CheckBox x:Name="chkTRv2" Content="TRv2 / Global Secure Access" IsChecked="True" Margin="0,5"/>
-                                <CheckBox x:Name="chkAppleSSO" Content="Apple SSO Extension" IsChecked="True" Margin="0,5"/>
                                 <Separator Margin="0,10" Background="#3C3C3C"/>
                                 <Button x:Name="btnSelectAll" Content="Select All" Margin="0,5"/>
                                 <Button x:Name="btnDeselectAll" Content="Deselect All" Margin="0,5" Background="#555555"/>
@@ -1186,14 +1167,6 @@ function Start-GUIMode {
         @{ Category = "TRv2"; Host = "passwordreset.microsoftonline.com"; Port = 443; Description = "Self-Service Password Reset"; Enabled = $true }
         @{ Category = "TRv2"; Host = "tunnel.globalsecureaccess.microsoft.com"; Port = 443; Description = "GSA Tunnel"; Enabled = $true }
         @{ Category = "TRv2"; Host = "edge.microsoft.com"; Port = 443; Description = "Edge Updates (TRv2)"; Enabled = $true }
-        
-        # Apple SSO Extension Endpoints
-        @{ Category = "AppleSSO"; Host = "app-site-association.cdn-apple.com"; Port = 443; Description = "Apple Associated Domains CDN"; Enabled = $true }
-        @{ Category = "AppleSSO"; Host = "app-site-association.networking.apple"; Port = 443; Description = "Apple Associated Domains"; Enabled = $true }
-        @{ Category = "AppleSSO"; Host = "sts.windows.net"; Port = 443; Description = "Security Token Service"; Enabled = $true }
-        @{ Category = "AppleSSO"; Host = "login.partner.microsoftonline.cn"; Port = 443; Description = "China Cloud Login"; Enabled = $true }
-        @{ Category = "AppleSSO"; Host = "login.microsoftonline.us"; Port = 443; Description = "US Gov Cloud Login"; Enabled = $true }
-        @{ Category = "AppleSSO"; Host = "login-us.microsoftonline.com"; Port = 443; Description = "US Region Login"; Enabled = $true }
     )
 
     # Load default endpoints
@@ -1303,14 +1276,10 @@ function Start-GUIMode {
         $trv2Enabled = $guiEndpointsList | Where-Object { $_.Category -eq "TRv2" -and $_.Enabled } | Measure-Object | Select-Object -ExpandProperty Count
         $trv2Total = $guiEndpointsList | Where-Object { $_.Category -eq "TRv2" } | Measure-Object | Select-Object -ExpandProperty Count
         
-        $appleSSOEnabled = $guiEndpointsList | Where-Object { $_.Category -eq "AppleSSO" -and $_.Enabled } | Measure-Object | Select-Object -ExpandProperty Count
-        $appleSSOTotal = $guiEndpointsList | Where-Object { $_.Category -eq "AppleSSO" } | Measure-Object | Select-Object -ExpandProperty Count
-        
         $chkAVD.IsChecked = ($avdEnabled -eq $avdTotal -and $avdTotal -gt 0)
         $chkM365.IsChecked = ($m365Enabled -eq $m365Total -and $m365Total -gt 0)
         $chkAzure.IsChecked = ($azureEnabled -eq $azureTotal -and $azureTotal -gt 0)
         $chkTRv2.IsChecked = ($trv2Enabled -eq $trv2Total -and $trv2Total -gt 0)
-        $chkAppleSSO.IsChecked = ($appleSSOEnabled -eq $appleSSOTotal -and $appleSSOTotal -gt 0)
     }
 
     function Export-ResultsGUI {
@@ -1410,20 +1379,6 @@ function Start-GUIMode {
     $chkTRv2.Add_Unchecked({
         foreach ($ep in $guiEndpointsList) {
             if ($ep.Category -eq "TRv2") { $ep.Enabled = $false }
-        }
-        $dgEndpoints.Items.Refresh()
-    })
-
-    $chkAppleSSO.Add_Checked({
-        foreach ($ep in $guiEndpointsList) {
-            if ($ep.Category -eq "AppleSSO") { $ep.Enabled = $true }
-        }
-        $dgEndpoints.Items.Refresh()
-    })
-
-    $chkAppleSSO.Add_Unchecked({
-        foreach ($ep in $guiEndpointsList) {
-            if ($ep.Category -eq "AppleSSO") { $ep.Enabled = $false }
         }
         $dgEndpoints.Items.Refresh()
     })
@@ -2040,7 +1995,6 @@ function Start-CLIMode {
         $endpointsToTest += $script:Microsoft365Endpoints
         $endpointsToTest += $script:AzureEndpoints
         $endpointsToTest += $script:TRv2Endpoints
-        $endpointsToTest += $script:AppleSSOEndpoints
         Write-ColorOutput "Testing ALL endpoint categories..." "Yellow"
     }
     else {
@@ -2059,10 +2013,6 @@ function Start-CLIMode {
         if ($TestTRv2) {
             $endpointsToTest += $script:TRv2Endpoints
             Write-ColorOutput "Testing TRv2 / Global Secure Access endpoints..." "Yellow"
-        }
-        if ($TestAppleSSO) {
-            $endpointsToTest += $script:AppleSSOEndpoints
-            Write-ColorOutput "Testing Apple SSO Extension endpoints..." "Yellow"
         }
     }
 
@@ -2227,7 +2177,7 @@ if ($DiscoverRootCAs) {
 }
 elseif ($NoGUI) {
     # NoGUI specified - run in CLI mode if tests are specified, otherwise show help
-    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAppleSSO -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
+    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
         Start-CLIMode
     }
     else {
@@ -2242,7 +2192,6 @@ elseif ($NoGUI) {
         Write-Host "  -TestMicrosoft365    Test Microsoft 365 endpoints"
         Write-Host "  -TestAzure           Test Azure service endpoints"
         Write-Host "  -TestTRv2            Test Tenant Restriction v2 / Global Secure Access endpoints"
-        Write-Host "  -TestAppleSSO        Test Apple SSO Extension endpoints (macOS/iOS)"
         Write-Host "  -TestAll             Test all endpoint categories"
         Write-Host "  -FetchM365Endpoints  Fetch live M365 endpoints from Microsoft"
         Write-Host "  -FetchAzureEndpoints Fetch live Azure endpoints from Microsoft"
