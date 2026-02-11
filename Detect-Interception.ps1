@@ -28,6 +28,9 @@
 .PARAMETER TestAppleSSO
     Tests Apple SSO Extension endpoints (required for Enterprise SSO on macOS/iOS)
 
+.PARAMETER TestHairpin
+    Tests for hairpin NAT (NAT loopback) by comparing internal vs external routing paths
+
 .PARAMETER TestAll
     Tests all endpoint categories
 
@@ -90,6 +93,7 @@ param(
     [switch]$TestAzure,
     [switch]$TestTRv2,
     [switch]$TestAppleSSO,
+    [switch]$TestHairpin,
     [switch]$TestAll,
     [switch]$FetchM365Endpoints,
     [switch]$FetchAzureEndpoints,
@@ -571,6 +575,391 @@ function Invoke-RootCADiscovery {
     Write-Host ""
     
     return $discoveredRootCAs
+}
+
+#endregion
+
+#region Hairpin NAT Detection
+
+function Test-HairpinNAT {
+    <#
+    .SYNOPSIS
+        Tests for hairpin NAT (NAT loopback) by comparing internal vs external routing paths
+    .DESCRIPTION
+        Hairpin NAT occurs when traffic from an internal host destined for a public IP
+        is routed back to an internal destination. This is detected by:
+        1. Comparing TTL differences between internal and external paths
+        2. Measuring latency differences
+        3. Performing traceroute analysis
+    .PARAMETER TargetIP
+        The public IP address to test (typically your organization's public IP)
+    .PARAMETER TargetPort
+        The port to test connectivity on (default: 443)
+    .PARAMETER InternalHost
+        Optional internal hostname to compare against
+    .PARAMETER TimeoutMs
+        Connection timeout in milliseconds (default: 5000)
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$TargetIP,
+        [int]$TargetPort = 443,
+        [string]$InternalHost,
+        [int]$TimeoutMs = 5000,
+        [int]$PingCount = 4
+    )
+    
+    $result = [PSCustomObject]@{
+        TargetIP = $TargetIP
+        TargetPort = $TargetPort
+        InternalHost = $InternalHost
+        IsHairpin = $false
+        HairpinConfidence = "Unknown"
+        HairpinIndicators = @()
+        ExternalLatencyMs = $null
+        InternalLatencyMs = $null
+        TTLToTarget = $null
+        HopCount = $null
+        TracerouteHops = @()
+        LocalIPAddresses = @()
+        RoutingDetails = ""
+        Error = $null
+        Success = $false
+    }
+    
+    try {
+        # Get local IP addresses for comparison
+        $localIPs = Get-NetIPAddress -AddressFamily IPv4 | 
+            Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+            Select-Object -ExpandProperty IPAddress
+        $result.LocalIPAddresses = $localIPs
+        
+        # Check if target IP is one of our local IPs (definite hairpin)
+        if ($localIPs -contains $TargetIP) {
+            $result.IsHairpin = $true
+            $result.HairpinConfidence = "Confirmed"
+            $result.HairpinIndicators += "Target IP matches local interface IP"
+            $result.Success = $true
+            return $result
+        }
+        
+        # Test 1: Ping-based TTL and latency analysis
+        Write-Host "  Testing connectivity to $TargetIP..." -ForegroundColor Gray
+        
+        $pingResults = @()
+        for ($i = 0; $i -lt $PingCount; $i++) {
+            try {
+                $ping = New-Object System.Net.NetworkInformation.Ping
+                $pingReply = $ping.Send($TargetIP, $TimeoutMs)
+                if ($pingReply.Status -eq 'Success') {
+                    $pingResults += [PSCustomObject]@{
+                        RTT = $pingReply.RoundtripTime
+                        TTL = $pingReply.Options.Ttl
+                    }
+                }
+                $ping.Dispose()
+            }
+            catch { }
+            Start-Sleep -Milliseconds 100
+        }
+        
+        if ($pingResults.Count -gt 0) {
+            $avgLatency = ($pingResults | Measure-Object -Property RTT -Average).Average
+            $result.ExternalLatencyMs = [math]::Round($avgLatency, 2)
+            $result.TTLToTarget = $pingResults[0].TTL
+            
+            # Estimate hop count (common initial TTL values are 64, 128, 255)
+            $initialTTL = 64
+            if ($pingResults[0].TTL -gt 64) { $initialTTL = 128 }
+            if ($pingResults[0].TTL -gt 128) { $initialTTL = 255 }
+            $result.HopCount = $initialTTL - $pingResults[0].TTL
+            
+            # Hairpin indicators based on TTL/latency
+            if ($result.HopCount -le 2 -and $avgLatency -lt 5) {
+                $result.HairpinIndicators += "Very low hop count ($($result.HopCount)) with sub-5ms latency suggests local routing"
+            }
+            if ($avgLatency -lt 1) {
+                $result.HairpinIndicators += "Sub-millisecond latency ($($result.ExternalLatencyMs)ms) indicates local network"
+            }
+        }
+        
+        # Test 2: Traceroute analysis (limited hops)
+        Write-Host "  Performing traceroute analysis..." -ForegroundColor Gray
+        
+        $traceHops = @()
+        for ($ttl = 1; $ttl -le 10; $ttl++) {
+            try {
+                $ping = New-Object System.Net.NetworkInformation.Ping
+                $options = New-Object System.Net.NetworkInformation.PingOptions($ttl, $true)
+                $buffer = [byte[]]::new(32)
+                $reply = $ping.Send($TargetIP, 1000, $buffer, $options)
+                
+                $hopInfo = [PSCustomObject]@{
+                    Hop = $ttl
+                    Address = if ($reply.Address) { $reply.Address.ToString() } else { "*" }
+                    RTT = if ($reply.Status -eq 'Success' -or $reply.Status -eq 'TtlExpired') { $reply.RoundtripTime } else { $null }
+                    Status = $reply.Status.ToString()
+                }
+                $traceHops += $hopInfo
+                $ping.Dispose()
+                
+                # If we reached the target, stop
+                if ($reply.Status -eq 'Success') {
+                    break
+                }
+            }
+            catch {
+                $traceHops += [PSCustomObject]@{
+                    Hop = $ttl
+                    Address = "*"
+                    RTT = $null
+                    Status = "Error"
+                }
+            }
+        }
+        $result.TracerouteHops = $traceHops
+        
+        # Analyze traceroute for hairpin patterns
+        if ($traceHops.Count -gt 0) {
+            $reachableHops = $traceHops | Where-Object { $_.Address -ne "*" }
+            
+            # Check if target is reached in 1-2 hops
+            $targetReached = $traceHops | Where-Object { $_.Address -eq $TargetIP }
+            if ($targetReached -and $targetReached.Hop -le 2) {
+                $result.HairpinIndicators += "Target reached in only $($targetReached.Hop) hop(s)"
+            }
+            
+            # Check for RFC1918 addresses in the path to a public IP
+            $privatePattern = '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)'
+            $privateHops = $reachableHops | Where-Object { $_.Address -match $privatePattern }
+            $allHopsPrivate = ($reachableHops | Where-Object { $_.Address -ne $TargetIP }) | 
+                Where-Object { $_.Address -notmatch $privatePattern }
+            
+            if ($privateHops.Count -gt 0 -and $allHopsPrivate.Count -eq 0) {
+                $result.HairpinIndicators += "All intermediate hops are private IPs (hairpin through NAT device)"
+            }
+            
+            # Build routing details
+            $routeDetails = "Route: "
+            foreach ($hop in $traceHops | Select-Object -First 5) {
+                $rtt = if ($hop.RTT) { "$($hop.RTT)ms" } else { "?" }
+                $routeDetails += "[$($hop.Hop)] $($hop.Address) ($rtt) -> "
+            }
+            $result.RoutingDetails = $routeDetails.TrimEnd(" -> ")
+        }
+        
+        # Test 3: TCP connection test to verify port accessibility
+        Write-Host "  Testing TCP connection on port $TargetPort..." -ForegroundColor Gray
+        
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $connectTask = $tcpClient.ConnectAsync($TargetIP, $TargetPort)
+            $connected = $connectTask.Wait($TimeoutMs)
+            
+            if ($connected -and $tcpClient.Connected) {
+                # Connection successful - measure actual TCP latency
+                $tcpClient.Close()
+                
+                # Quick TCP latency test
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $tcpClient2 = New-Object System.Net.Sockets.TcpClient
+                $connectTask2 = $tcpClient2.ConnectAsync($TargetIP, $TargetPort)
+                if ($connectTask2.Wait($TimeoutMs)) {
+                    $sw.Stop()
+                    $tcpLatency = $sw.ElapsedMilliseconds
+                    
+                    if ($tcpLatency -lt 3) {
+                        $result.HairpinIndicators += "TCP connection established in ${tcpLatency}ms (very fast - likely local)"
+                    }
+                }
+                $tcpClient2.Close()
+            }
+        }
+        catch {
+            # Connection failed - this is informational only
+        }
+        
+        # Test 4: Compare with internal host if provided
+        if ($InternalHost) {
+            Write-Host "  Comparing with internal host $InternalHost..." -ForegroundColor Gray
+            
+            try {
+                $internalPings = @()
+                for ($i = 0; $i -lt $PingCount; $i++) {
+                    $ping = New-Object System.Net.NetworkInformation.Ping
+                    $reply = $ping.Send($InternalHost, $TimeoutMs)
+                    if ($reply.Status -eq 'Success') {
+                        $internalPings += $reply.RoundtripTime
+                    }
+                    $ping.Dispose()
+                }
+                
+                if ($internalPings.Count -gt 0) {
+                    $result.InternalLatencyMs = [math]::Round(($internalPings | Measure-Object -Average).Average, 2)
+                    
+                    # Compare latencies - if they're similar, likely hairpin
+                    if ($result.ExternalLatencyMs -and $result.InternalLatencyMs) {
+                        $latencyDiff = [math]::Abs($result.ExternalLatencyMs - $result.InternalLatencyMs)
+                        if ($latencyDiff -lt 2) {
+                            $result.HairpinIndicators += "Latency to public IP ($($result.ExternalLatencyMs)ms) similar to internal host ($($result.InternalLatencyMs)ms)"
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+        
+        # Determine overall hairpin status
+        $indicatorCount = $result.HairpinIndicators.Count
+        if ($indicatorCount -ge 3) {
+            $result.IsHairpin = $true
+            $result.HairpinConfidence = "High"
+        }
+        elseif ($indicatorCount -eq 2) {
+            $result.IsHairpin = $true
+            $result.HairpinConfidence = "Medium"
+        }
+        elseif ($indicatorCount -eq 1) {
+            $result.IsHairpin = $false
+            $result.HairpinConfidence = "Low (possible)"
+        }
+        else {
+            $result.IsHairpin = $false
+            $result.HairpinConfidence = "No hairpin detected"
+        }
+        
+        $result.Success = $true
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+        $result.Success = $false
+    }
+    
+    return $result
+}
+
+function Get-PublicIPAddress {
+    <#
+    .SYNOPSIS
+        Gets the current public IP address using external services
+    #>
+    $services = @(
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com"
+    )
+    
+    foreach ($service in $services) {
+        try {
+            $response = Invoke-RestMethod -Uri $service -TimeoutSec 5 -ErrorAction Stop
+            $ip = $response.Trim()
+            if ($ip -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                return $ip
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    return $null
+}
+
+function Invoke-HairpinTest {
+    <#
+    .SYNOPSIS
+        Interactive hairpin NAT test with automatic public IP detection
+    #>
+    param(
+        [string]$TargetIP,
+        [int]$TargetPort = 443,
+        [string]$InternalHost,
+        [switch]$AutoDetectPublicIP
+    )
+    
+    Write-Host ""
+    Write-Host "Hairpin NAT Detection" -ForegroundColor Cyan
+    Write-Host "=====================" -ForegroundColor Cyan
+    Write-Host ""
+    
+    # Auto-detect public IP if requested or no target provided
+    if ($AutoDetectPublicIP -or -not $TargetIP) {
+        Write-Host "Detecting public IP address..." -ForegroundColor Yellow
+        $detectedIP = Get-PublicIPAddress
+        if ($detectedIP) {
+            Write-Host "Detected public IP: $detectedIP" -ForegroundColor Green
+            if (-not $TargetIP) {
+                $TargetIP = $detectedIP
+            }
+        }
+        else {
+            Write-Host "Could not auto-detect public IP" -ForegroundColor Red
+            if (-not $TargetIP) {
+                Write-Host "Please specify a target IP with -TargetIP parameter" -ForegroundColor Yellow
+                return
+            }
+        }
+    }
+    
+    Write-Host "Testing hairpin NAT for: $TargetIP`:$TargetPort" -ForegroundColor Yellow
+    Write-Host ""
+    
+    $result = Test-HairpinNAT -TargetIP $TargetIP -TargetPort $TargetPort -InternalHost $InternalHost
+    
+    # Display results
+    Write-Host ""
+    Write-Host "Results" -ForegroundColor Cyan
+    Write-Host "=======" -ForegroundColor Cyan
+    
+    if ($result.Success) {
+        $statusColor = if ($result.IsHairpin) { "Yellow" } else { "Green" }
+        $statusIcon = if ($result.IsHairpin) { "[!]" } else { "[OK]" }
+        
+        Write-Host ""
+        Write-Host "$statusIcon Hairpin NAT: $(if($result.IsHairpin){'DETECTED'}else{'Not Detected'})" -ForegroundColor $statusColor
+        Write-Host "    Confidence: $($result.HairpinConfidence)" -ForegroundColor $statusColor
+        Write-Host ""
+        
+        Write-Host "Network Metrics:" -ForegroundColor White
+        if ($result.ExternalLatencyMs) {
+            Write-Host "  Latency to target: $($result.ExternalLatencyMs)ms" -ForegroundColor Gray
+        }
+        if ($result.InternalLatencyMs) {
+            Write-Host "  Latency to internal: $($result.InternalLatencyMs)ms" -ForegroundColor Gray
+        }
+        if ($result.HopCount) {
+            Write-Host "  Estimated hops: $($result.HopCount)" -ForegroundColor Gray
+        }
+        if ($result.TTLToTarget) {
+            Write-Host "  TTL received: $($result.TTLToTarget)" -ForegroundColor Gray
+        }
+        
+        if ($result.RoutingDetails) {
+            Write-Host ""
+            Write-Host "Routing Path:" -ForegroundColor White
+            Write-Host "  $($result.RoutingDetails)" -ForegroundColor Gray
+        }
+        
+        if ($result.HairpinIndicators.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Indicators:" -ForegroundColor White
+            foreach ($indicator in $result.HairpinIndicators) {
+                Write-Host "  - $indicator" -ForegroundColor Yellow
+            }
+        }
+        
+        Write-Host ""
+        Write-Host "Local IP Addresses:" -ForegroundColor White
+        foreach ($ip in $result.LocalIPAddresses) {
+            Write-Host "  - $ip" -ForegroundColor Gray
+        }
+    }
+    else {
+        Write-Host "[X] Test failed: $($result.Error)" -ForegroundColor Red
+    }
+    
+    Write-Host ""
+    return $result
 }
 
 #endregion
@@ -1100,6 +1489,143 @@ function Start-GUIMode {
                         <Button x:Name="btnDiscoverCAs" Content="Discover &amp; Update Root CAs" Padding="15,8" Margin="0,0,10,0"/>
                         <TextBlock x:Name="txtCAStatus" VerticalAlignment="Center" Foreground="#888888" Text=""/>
                     </StackPanel>
+                </Grid>
+            </TabItem>
+            
+            <!-- Hairpin NAT Detection Tab -->
+            <TabItem Header="Hairpin NAT">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    
+                    <!-- Description -->
+                    <StackPanel Grid.Row="0" Margin="0,0,0,15">
+                        <TextBlock Text="Hairpin NAT Detection" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+                        <TextBlock Text="Detect NAT loopback where traffic to your public IP is routed back internally" 
+                                   Foreground="#888888" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    
+                    <!-- Configuration -->
+                    <Grid Grid.Row="1" Margin="0,0,0,15">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="350"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        
+                        <GroupBox Grid.Column="0" Header="Test Configuration">
+                            <StackPanel Margin="5">
+                                <TextBlock Text="Target Public IP:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="txtHairpinIP" Grid.Column="0" Margin="0,0,5,0"/>
+                                    <Button x:Name="btnDetectIP" Grid.Column="1" Content="Auto-Detect" Padding="10,3" Background="#107C10"/>
+                                </Grid>
+                                
+                                <TextBlock Text="Port (optional):" Foreground="#CCCCCC" Margin="0,10,0,3"/>
+                                <TextBox x:Name="txtHairpinPort" Text="443" Width="80" HorizontalAlignment="Left"/>
+                                
+                                <TextBlock Text="Internal Host (optional, for comparison):" Foreground="#CCCCCC" Margin="0,10,0,3"/>
+                                <TextBox x:Name="txtHairpinInternal"/>
+                                
+                                <Button x:Name="btnRunHairpin" Content="Run Hairpin Test" Margin="0,15,0,0" Padding="15,8"/>
+                                <TextBlock x:Name="txtHairpinStatus" Text="" Foreground="#888888" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </GroupBox>
+                        
+                        <GroupBox Grid.Column="1" Header="What is Hairpin NAT?" Margin="10,0,0,0">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <TextBlock Foreground="#AAAAAA" TextWrapping="Wrap" Margin="5">
+                                    <Run FontWeight="Bold">Hairpin NAT</Run> (also called NAT loopback) occurs when:
+                                    <LineBreak/><LineBreak/>
+                                    1. An internal client sends traffic to a public IP
+                                    <LineBreak/>
+                                    2. The NAT device recognizes it's destined for an internal server
+                                    <LineBreak/>
+                                    3. Traffic is "hairpinned" back to the internal network
+                                    <LineBreak/><LineBreak/>
+                                    <Run FontWeight="Bold">Detection Methods:</Run>
+                                    <LineBreak/>
+                                    • TTL analysis (low hop count to public IP)
+                                    <LineBreak/>
+                                    • Latency comparison (sub-millisecond to public IP)
+                                    <LineBreak/>
+                                    • Traceroute showing only private hops
+                                    <LineBreak/>
+                                    • TCP connection timing analysis
+                                    <LineBreak/><LineBreak/>
+                                    <Run FontWeight="Bold">Why it matters:</Run>
+                                    <LineBreak/>
+                                    Hairpin NAT can cause unexpected routing, bypass security controls, 
+                                    or indicate network misconfiguration.
+                                </TextBlock>
+                            </ScrollViewer>
+                        </GroupBox>
+                    </Grid>
+                    
+                    <!-- Results -->
+                    <GroupBox Grid.Row="2" Header="Test Results">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            
+                            <!-- Summary -->
+                            <Grid Grid.Row="0" Margin="0,5,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                
+                                <Border Grid.Column="0" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Status" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinResult" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="1" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Latency" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinLatency" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="2" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Hops" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinHops" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="3" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Confidence" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinConfidence" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                            
+                            <!-- Details -->
+                            <Border Grid.Row="1" Background="#1E1E1E" CornerRadius="4" Padding="10">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                    <TextBlock x:Name="txtHairpinDetails" 
+                                               Foreground="#CCCCCC" 
+                                               FontFamily="Consolas" 
+                                               FontSize="12"
+                                               TextWrapping="Wrap"/>
+                                </ScrollViewer>
+                            </Border>
+                        </Grid>
+                    </GroupBox>
                 </Grid>
             </TabItem>
         </TabControl>
@@ -1725,6 +2251,153 @@ function Start-GUIMode {
         }
     })
 
+    # Hairpin NAT Detection - Auto-Detect IP button
+    $btnDetectIP.Add_Click({
+        $txtHairpinStatus.Text = "Detecting public IP..."
+        $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        
+        try {
+            $publicIP = Get-PublicIPAddress
+            if ($publicIP) {
+                $txtHairpinIP.Text = $publicIP
+                $txtHairpinStatus.Text = "Detected: $publicIP"
+            }
+            else {
+                $txtHairpinStatus.Text = "Could not detect public IP"
+            }
+        }
+        catch {
+            $txtHairpinStatus.Text = "Error: $($_.Exception.Message)"
+        }
+    })
+
+    # Hairpin NAT Detection - Run Test button
+    $btnRunHairpin.Add_Click({
+        $targetIP = $txtHairpinIP.Text.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($targetIP)) {
+            [System.Windows.MessageBox]::Show("Please enter a target IP address or click 'Auto-Detect' to find your public IP.", "No Target IP", "OK", "Warning")
+            return
+        }
+        
+        # Validate IP format
+        if ($targetIP -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+            [System.Windows.MessageBox]::Show("Please enter a valid IP address (e.g., 203.0.113.1)", "Invalid IP", "OK", "Warning")
+            return
+        }
+        
+        $port = 443
+        if ($txtHairpinPort.Text -match '^\d+$') {
+            $port = [int]$txtHairpinPort.Text
+        }
+        
+        $internalHost = $txtHairpinInternal.Text.Trim()
+        
+        # Update UI
+        $btnRunHairpin.IsEnabled = $false
+        $txtHairpinStatus.Text = "Running hairpin NAT test..."
+        $txtHairpinResult.Text = "Testing..."
+        $txtHairpinLatency.Text = "-"
+        $txtHairpinHops.Text = "-"
+        $txtHairpinConfidence.Text = "-"
+        $txtHairpinDetails.Text = ""
+        $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        
+        try {
+            # Run the hairpin test
+            $result = Test-HairpinNAT -TargetIP $targetIP -TargetPort $port -InternalHost $internalHost
+            
+            if ($result.Success) {
+                # Update summary cards
+                if ($result.IsHairpin) {
+                    $txtHairpinResult.Text = "DETECTED"
+                    $txtHairpinResult.Foreground = [System.Windows.Media.Brushes]::Orange
+                }
+                else {
+                    $txtHairpinResult.Text = "Not Detected"
+                    $txtHairpinResult.Foreground = [System.Windows.Media.Brushes]::LightGreen
+                }
+                
+                $txtHairpinLatency.Text = if ($result.ExternalLatencyMs) { "$($result.ExternalLatencyMs)ms" } else { "N/A" }
+                $txtHairpinHops.Text = if ($result.HopCount) { $result.HopCount.ToString() } else { "N/A" }
+                $txtHairpinConfidence.Text = $result.HairpinConfidence
+                
+                # Build detailed output
+                $details = @()
+                $details += "Target: $($result.TargetIP):$($result.TargetPort)"
+                $details += "Test Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                $details += ""
+                $details += "=== RESULT ==="
+                $details += "Hairpin NAT: $(if($result.IsHairpin){'YES - DETECTED'}else{'No'})"
+                $details += "Confidence: $($result.HairpinConfidence)"
+                $details += ""
+                $details += "=== NETWORK METRICS ==="
+                
+                if ($result.ExternalLatencyMs) {
+                    $details += "Latency to target: $($result.ExternalLatencyMs)ms"
+                }
+                if ($result.InternalLatencyMs) {
+                    $details += "Latency to internal host: $($result.InternalLatencyMs)ms"
+                }
+                if ($result.TTLToTarget) {
+                    $details += "TTL received: $($result.TTLToTarget)"
+                }
+                if ($result.HopCount) {
+                    $details += "Estimated hops: $($result.HopCount)"
+                }
+                
+                if ($result.RoutingDetails) {
+                    $details += ""
+                    $details += "=== ROUTING PATH ==="
+                    $details += $result.RoutingDetails
+                }
+                
+                if ($result.TracerouteHops.Count -gt 0) {
+                    $details += ""
+                    $details += "=== TRACEROUTE ==="
+                    foreach ($hop in $result.TracerouteHops) {
+                        $rtt = if ($hop.RTT -ne $null) { "$($hop.RTT)ms" } else { "*" }
+                        $details += "  Hop $($hop.Hop): $($hop.Address) ($rtt) - $($hop.Status)"
+                    }
+                }
+                
+                if ($result.HairpinIndicators.Count -gt 0) {
+                    $details += ""
+                    $details += "=== HAIRPIN INDICATORS ==="
+                    foreach ($indicator in $result.HairpinIndicators) {
+                        $details += "  [!] $indicator"
+                    }
+                }
+                
+                if ($result.LocalIPAddresses.Count -gt 0) {
+                    $details += ""
+                    $details += "=== LOCAL IP ADDRESSES ==="
+                    foreach ($ip in $result.LocalIPAddresses) {
+                        $details += "  - $ip"
+                    }
+                }
+                
+                $txtHairpinDetails.Text = $details -join "`n"
+                $txtHairpinStatus.Text = "Test completed"
+            }
+            else {
+                $txtHairpinResult.Text = "Error"
+                $txtHairpinResult.Foreground = [System.Windows.Media.Brushes]::Red
+                $txtHairpinDetails.Text = "Test failed: $($result.Error)"
+                $txtHairpinStatus.Text = "Test failed"
+            }
+        }
+        catch {
+            $txtHairpinResult.Text = "Error"
+            $txtHairpinResult.Foreground = [System.Windows.Media.Brushes]::Red
+            $txtHairpinDetails.Text = "Error: $($_.Exception.Message)"
+            $txtHairpinStatus.Text = "Error occurred"
+        }
+        finally {
+            $btnRunHairpin.IsEnabled = $true
+        }
+    })
+
     # Stop button
     $btnStop.Add_Click({
         $script:guiScanCancelled = $true
@@ -1913,7 +2586,9 @@ function Test-EndpointCLI {
         Write-ColorOutput "  Root Thumbprint: $($result.RootThumbprint)" "Gray"
         
         if ($result.IsIntercepted) {
-            Write-ColorOutput "`n  [!] INTERCEPTION DETECTED!" "Red"
+            Write-ColorOutput "`n  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" "Red"
+            Write-ColorOutput "  [!!] INTERCEPTION DETECTED!" "Red"
+            Write-ColorOutput "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" "Red"
             Write-ColorOutput "  $($result.InterceptionDetails)" "Yellow"
             Write-ColorOutput "  The certificate chain does not end in a known Microsoft/trusted root CA." "Yellow"
         }
@@ -2154,25 +2829,40 @@ function Start-CLIMode {
 
     Write-ColorOutput "`nTotal Endpoints Tested: $($allResults.Count)" "White"
     Write-ColorOutput "  [OK] Trusted (No Interception): $($trusted.Count)" "Green"
-    Write-ColorOutput "  [!] Intercepted: $($intercepted.Count)" "$(if ($intercepted.Count -gt 0) { 'Red' } else { 'Green' })"
-    Write-ColorOutput "  [X] Connection Failed: $($failed.Count)" "$(if ($failed.Count -gt 0) { 'Yellow' } else { 'Green' })"
+    if ($intercepted.Count -gt 0) {
+        Write-ColorOutput "  [!!] INTERCEPTED: $($intercepted.Count)" "Red"
+    } else {
+        Write-ColorOutput "  [OK] Intercepted: 0" "Green"
+    }
+    if ($failed.Count -gt 0) {
+        Write-ColorOutput "  [X]  Connection Failed: $($failed.Count)" "Yellow"
+    } else {
+        Write-ColorOutput "  [OK] Connection Failed: 0" "Green"
+    }
 
     if ($intercepted.Count -gt 0) {
         Write-ColorOutput "`n" "White"
         Write-ColorOutput ("!" * 80) "Red"
-        Write-ColorOutput "WARNING: SSL/TLS INTERCEPTION DETECTED!" "Red"
+        Write-ColorOutput "  [!] WARNING: SSL/TLS INTERCEPTION DETECTED!" "Red"
         Write-ColorOutput ("!" * 80) "Red"
         Write-ColorOutput "`nThe following endpoints are being intercepted:" "Yellow"
         
         foreach ($ep in $intercepted) {
-            Write-ColorOutput "  - $($ep.Description) ($($ep.Hostname):$($ep.Port))" "Yellow"
-            Write-ColorOutput "    Intercepting CA: $($ep.RootCA)" "Gray"
+            Write-ColorOutput "  >>> $($ep.Description) ($($ep.Hostname):$($ep.Port))" "Red"
+            Write-ColorOutput "      Intercepting CA: $($ep.RootCA)" "Yellow"
         }
         
         Write-ColorOutput "`nRECOMMENDATION:" "Cyan"
         Write-ColorOutput "SSL/TLS interception can cause authentication failures and connectivity" "White"
         Write-ColorOutput "issues. Consider configuring your proxy to bypass inspection for" "White"
         Write-ColorOutput "critical endpoints." "White"
+    }
+    else {
+        Write-ColorOutput "`n" "White"
+        Write-ColorOutput ("=" * 80) "Green"
+        Write-ColorOutput "  [OK] ALL CLEAR - NO INTERCEPTION DETECTED" "Green"
+        Write-ColorOutput ("=" * 80) "Green"
+        Write-ColorOutput "`nAll tested endpoints are using trusted Microsoft certificate chains." "Green"
     }
 
     if ($failed.Count -gt 0) {
@@ -2227,8 +2917,14 @@ if ($DiscoverRootCAs) {
 }
 elseif ($NoGUI) {
     # NoGUI specified - run in CLI mode if tests are specified, otherwise show help
-    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAppleSSO -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
-        Start-CLIMode
+    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAppleSSO -or $TestHairpin -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
+        if ($TestHairpin) {
+            # Run hairpin test in CLI mode
+            Invoke-HairpinTest -AutoDetectPublicIP
+        }
+        if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAppleSSO -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
+            Start-CLIMode
+        }
     }
     else {
         Write-Host ""
@@ -2243,6 +2939,7 @@ elseif ($NoGUI) {
         Write-Host "  -TestAzure           Test Azure service endpoints"
         Write-Host "  -TestTRv2            Test Tenant Restriction v2 / Global Secure Access endpoints"
         Write-Host "  -TestAppleSSO        Test Apple SSO Extension endpoints (macOS/iOS)"
+        Write-Host "  -TestHairpin         Test for hairpin NAT (NAT loopback) detection"
         Write-Host "  -TestAll             Test all endpoint categories"
         Write-Host "  -FetchM365Endpoints  Fetch live M365 endpoints from Microsoft"
         Write-Host "  -FetchAzureEndpoints Fetch live Azure endpoints from Microsoft"
@@ -2257,6 +2954,7 @@ elseif ($NoGUI) {
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -FetchM365Endpoints"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAVD -FetchAzureEndpoints"
         Write-Host "  .\Detect-Interception.ps1 -DiscoverRootCAs"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestHairpin"
         Write-Host ""
         Write-Host "Note: -NoGUI requires at least one test parameter to be specified." -ForegroundColor Yellow
     }
