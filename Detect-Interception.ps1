@@ -2811,7 +2811,7 @@ function Start-GUIMode {
                     $details += ""
                     $details += "=== TRACEROUTE ==="
                     foreach ($hop in $result.TracerouteHops) {
-                        $rtt = if ($hop.RTT -ne $null) { "$($hop.RTT)ms" } else { "*" }
+                        $rtt = if ($null -ne $hop.RTT) { "$($hop.RTT)ms" } else { "*" }
                         $details += "  Hop $($hop.Hop): $($hop.Address) ($rtt) - $($hop.Status)"
                     }
                 }
