@@ -1,0 +1,62 @@
+﻿================================================================================
+SSL/TLS Interception Detection Results
+Generated: 2026-02-11 18:36:25
+Computer: JIMWEST-AURORA
+User: jimwest
+================================================================================
+
+SUMMARY
+----------------------------------------
+Total Endpoints Tested: 4
+Trusted (No Interception): 3
+Intercepted: 
+Connection Failed: 0
+
+
+DETAILED RESULTS
+----------------------------------------
+
+Endpoint: login.microsoftonline.com:443
+  Status: Connected
+  Certificate Subject: CN=login.microsoftonline.com, O=Microsoft Corporation, L=Redmond, S=Washington, C=US
+  Certificate Issuer: CN=DigiCert SHA2 Secure Server CA, O=DigiCert Inc, C=US
+  Thumbprint: E00F2721F8ED3972308D88B1FB31DB8DE928A81E
+  Valid: 02/09/2026 18:00:00 to 08/09/2026 18:59:59
+  Root CA: CN=DigiCert Global Root CA, OU=www.digicert.com, O=DigiCert Inc, C=US
+  Root Thumbprint: A8985D3A65E5E5C4B2D7D66D40C6DD2FB19C5436
+  Interception Detected: False
+
+Endpoint: device.login.microsoftonline.com:443
+  Status: Connected
+  Certificate Subject: CN=login.windows.net, O=Microsoft Corporation, L=Redmond, S=Washington, C=US
+  Certificate Issuer: CN=DigiCert SHA2 Secure Server CA, O=DigiCert Inc, C=US
+  Thumbprint: 45971F7C85254075AE72D35F11D0E28C9CBEDA72
+  Valid: 02/03/2026 18:00:00 to 08/03/2026 18:59:59
+  Root CA: CN=DigiCert Global Root CA, OU=www.digicert.com, O=DigiCert Inc, C=US
+  Root Thumbprint: A8985D3A65E5E5C4B2D7D66D40C6DD2FB19C5436
+  Interception Detected: False
+
+Endpoint: enterpriseregistration.windows.net:443
+  Status: Connected
+  Certificate Subject: CN=enterpriseregistration.windows.net, O=Microsoft Corporation, L=Redmond, S=WA, C=US
+  Certificate Issuer: CN=Microsoft Azure RSA TLS Issuing CA 08, O=Microsoft Corporation, C=US
+  Thumbprint: 6FB4655D968ECD43E15B3EF7B98B6D0884918612
+  Valid: 01/16/2026 08:35:48 to 07/15/2026 09:35:48
+  Root CA: CN=DigiCert Global Root G2, OU=www.digicert.com, O=DigiCert Inc, C=US
+  Root Thumbprint: DF3C24F9BFD666761B268073FE06D1CC8D4F82A4
+  Interception Detected: False
+
+Endpoint: certauth.sts.exxonmobil.cloud:443
+  Status: Connected
+  Certificate Subject: CN=sts.exxonmobil.cloud, O=ExxonMobil, L=Houston, S=Texas, C=US
+  Certificate Issuer: CN=Entrust OV TLS Issuing RSA CA 1, O=SSL Corporation, C=US
+  Thumbprint: 442B078F62A1642B9E582F0CF525D302BBA1B054
+  Valid: 06/04/2025 08:12:04 to 06/30/2026 23:00:00
+  Root CA: CN=SSL.com TLS RSA Root CA 2022, O=SSL Corporation, C=US
+  Root Thumbprint: EC2C834072AF269510FF0EF203EE3170F6789DCA
+  Interception Detected: True
+  [!] Unknown Root CA detected. This certificate was likely issued by an intercepting proxy.
+
+================================================================================
+End of Report
+================================================================================

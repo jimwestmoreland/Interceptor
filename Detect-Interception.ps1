@@ -964,6 +964,319 @@ function Invoke-HairpinTest {
 
 #endregion
 
+#region Teams Jitter Testing
+
+# Microsoft Teams media relay endpoints for jitter testing
+$script:TeamsMediaEndpoints = @(
+    @{ Host = "13.107.64.0"; Description = "Teams Media Relay (Global)"; Region = "Global" }
+    @{ Host = "52.120.0.0"; Description = "Teams Media Relay (Americas)"; Region = "Americas" }
+    @{ Host = "52.112.0.0"; Description = "Teams Media Relay (EMEA)"; Region = "EMEA" }
+    @{ Host = "52.122.0.0"; Description = "Teams Media Relay (APAC)"; Region = "APAC" }
+    @{ Host = "worldaz.tr.teams.microsoft.com"; Description = "Teams Transport Relay"; Region = "Global" }
+    @{ Host = "teams.microsoft.com"; Description = "Teams Web Service"; Region = "Global" }
+    @{ Host = "statics.teams.cdn.office.net"; Description = "Teams CDN"; Region = "Global" }
+)
+
+function Test-NetworkJitter {
+    <#
+    .SYNOPSIS
+        Tests network jitter (latency variation) to a target host
+    .DESCRIPTION
+        Sends multiple ICMP ping requests and calculates jitter metrics including:
+        - Average latency
+        - Min/Max latency
+        - Jitter (standard deviation of latency)
+        - Packet loss percentage
+        - ICMP blocked detection
+    .PARAMETER Target
+        The hostname or IP to test
+    .PARAMETER PingCount
+        Number of ping requests to send (default: 50)
+    .PARAMETER IntervalMs
+        Interval between pings in milliseconds (default: 50)
+    .PARAMETER TimeoutMs
+        Timeout for each ping in milliseconds (default: 1000)
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Target,
+        [string]$Description = "",
+        [int]$PingCount = 50,
+        [int]$IntervalMs = 50,
+        [int]$TimeoutMs = 1000
+    )
+    
+    $result = [PSCustomObject]@{
+        Target = $Target
+        Description = $Description
+        Success = $false
+        PingsSent = $PingCount
+        PingsReceived = 0
+        PacketLoss = 100.0
+        MinLatency = $null
+        MaxLatency = $null
+        AvgLatency = $null
+        Jitter = $null
+        JitterRating = "Unknown"
+        Latencies = @()
+        ICMPBlocked = $false
+        ICMPBlockedReason = $null
+        HostReachable = $null
+        PingStatuses = @{}
+        Error = $null
+    }
+    
+    try {
+        $latencies = @()
+        $pingStatuses = @{}
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        
+        for ($i = 0; $i -lt $PingCount; $i++) {
+            try {
+                $reply = $ping.Send($Target, $TimeoutMs)
+                
+                # Track status counts
+                $statusKey = $reply.Status.ToString()
+                if ($pingStatuses.ContainsKey($statusKey)) {
+                    $pingStatuses[$statusKey]++
+                } else {
+                    $pingStatuses[$statusKey] = 1
+                }
+                
+                if ($reply.Status -eq 'Success') {
+                    $latencies += $reply.RoundtripTime
+                }
+            }
+            catch {
+                # Track exceptions as a status
+                if ($pingStatuses.ContainsKey("Exception")) {
+                    $pingStatuses["Exception"]++
+                } else {
+                    $pingStatuses["Exception"] = 1
+                }
+            }
+            
+            if ($IntervalMs -gt 0 -and $i -lt ($PingCount - 1)) {
+                Start-Sleep -Milliseconds $IntervalMs
+            }
+        }
+        
+        $ping.Dispose()
+        $result.Latencies = $latencies
+        $result.PingsReceived = $latencies.Count
+        $result.PacketLoss = [math]::Round((($PingCount - $latencies.Count) / $PingCount) * 100, 2)
+        $result.PingStatuses = $pingStatuses
+        
+        if ($latencies.Count -gt 1) {
+            $result.MinLatency = ($latencies | Measure-Object -Minimum).Minimum
+            $result.MaxLatency = ($latencies | Measure-Object -Maximum).Maximum
+            $result.AvgLatency = [math]::Round(($latencies | Measure-Object -Average).Average, 2)
+            
+            # Calculate jitter (standard deviation)
+            $avg = $result.AvgLatency
+            $sumSquares = 0
+            foreach ($lat in $latencies) {
+                $sumSquares += [math]::Pow(($lat - $avg), 2)
+            }
+            $result.Jitter = [math]::Round([math]::Sqrt($sumSquares / $latencies.Count), 2)
+            
+            # Rate jitter quality for Teams
+            # Microsoft recommends: Jitter < 30ms for good quality
+            if ($result.Jitter -lt 10) {
+                $result.JitterRating = "Excellent"
+            }
+            elseif ($result.Jitter -lt 20) {
+                $result.JitterRating = "Good"
+            }
+            elseif ($result.Jitter -lt 30) {
+                $result.JitterRating = "Acceptable"
+            }
+            elseif ($result.Jitter -lt 50) {
+                $result.JitterRating = "Poor"
+            }
+            else {
+                $result.JitterRating = "Very Poor"
+            }
+            
+            $result.Success = $true
+        }
+        elseif ($latencies.Count -eq 1) {
+            $result.MinLatency = $latencies[0]
+            $result.MaxLatency = $latencies[0]
+            $result.AvgLatency = $latencies[0]
+            $result.Jitter = 0
+            $result.JitterRating = "Insufficient data"
+            $result.Success = $true
+        }
+        else {
+            # No successful pings - check if ICMP might be blocked
+            $result.Error = "No successful ping responses received"
+            
+            # Analyze ping statuses to determine likely cause
+            $timeoutCount = if ($pingStatuses.ContainsKey("TimedOut")) { $pingStatuses["TimedOut"] } else { 0 }
+            $destUnreachable = if ($pingStatuses.ContainsKey("DestinationHostUnreachable")) { $pingStatuses["DestinationHostUnreachable"] } else { 0 }
+            $destNetUnreachable = if ($pingStatuses.ContainsKey("DestinationNetworkUnreachable")) { $pingStatuses["DestinationNetworkUnreachable"] } else { 0 }
+            
+            # If all pings timed out, ICMP might be blocked - verify with TCP
+            if ($timeoutCount -eq $PingCount -or ($timeoutCount + $destUnreachable) -eq $PingCount) {
+                # Try TCP connection to common ports to verify host is reachable
+                $tcpReachable = $false
+                $testPorts = @(443, 80, 3478, 3479, 3480)  # HTTPS, HTTP, and Teams media ports
+                
+                foreach ($port in $testPorts) {
+                    try {
+                        $tcpClient = New-Object System.Net.Sockets.TcpClient
+                        $connectTask = $tcpClient.ConnectAsync($Target, $port)
+                        if ($connectTask.Wait(2000)) {
+                            if ($tcpClient.Connected) {
+                                $tcpReachable = $true
+                                $tcpClient.Close()
+                                break
+                            }
+                        }
+                        $tcpClient.Close()
+                    }
+                    catch {
+                        # Port not open, try next
+                    }
+                }
+                
+                $result.HostReachable = $tcpReachable
+                
+                if ($tcpReachable) {
+                    $result.ICMPBlocked = $true
+                    $result.ICMPBlockedReason = "Host is reachable via TCP but all ICMP pings failed. ICMP/ping is likely blocked by firewall."
+                    $result.Error = "ICMP BLOCKED - Host reachable via TCP but not responding to ping"
+                }
+                else {
+                    $result.ICMPBlockedReason = "Host not reachable via ICMP or TCP. May be offline, blocked, or network issue."
+                }
+            }
+            elseif ($destNetUnreachable -gt 0) {
+                $result.ICMPBlockedReason = "Destination network unreachable - routing issue or network blocked"
+            }
+            
+            # Add status breakdown to error
+            if ($pingStatuses.Count -gt 0) {
+                $statusSummary = ($pingStatuses.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join ", "
+                $result.Error += " [Statuses: $statusSummary]"
+            }
+        }
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+    }
+    
+    return $result
+}
+
+function Test-TeamsJitter {
+    <#
+    .SYNOPSIS
+        Tests jitter to multiple Microsoft Teams media endpoints
+    .PARAMETER PingCount
+        Number of pings per endpoint (default: 50)
+    .PARAMETER TestAllRegions
+        Test all regional endpoints, not just global
+    #>
+    param(
+        [int]$PingCount = 50,
+        [switch]$TestAllRegions
+    )
+    
+    $results = @()
+    $endpointsToTest = if ($TestAllRegions) {
+        $script:TeamsMediaEndpoints
+    } else {
+        $script:TeamsMediaEndpoints | Where-Object { $_.Region -eq "Global" }
+    }
+    
+    Write-Host ""
+    Write-Host "Microsoft Teams Jitter Test" -ForegroundColor Cyan
+    Write-Host "============================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Testing $($endpointsToTest.Count) endpoints with $PingCount pings each..." -ForegroundColor Yellow
+    Write-Host ""
+    
+    foreach ($endpoint in $endpointsToTest) {
+        Write-Host "Testing $($endpoint.Host) ($($endpoint.Description))..." -ForegroundColor Gray
+        
+        $result = Test-NetworkJitter -Target $endpoint.Host -Description $endpoint.Description -PingCount $PingCount
+        $results += $result
+        
+        if ($result.Success) {
+            $color = switch ($result.JitterRating) {
+                "Excellent" { "Green" }
+                "Good" { "Green" }
+                "Acceptable" { "Yellow" }
+                "Poor" { "Red" }
+                "Very Poor" { "Red" }
+                default { "Gray" }
+            }
+            Write-Host "  Latency: $($result.AvgLatency)ms (min: $($result.MinLatency)ms, max: $($result.MaxLatency)ms)" -ForegroundColor Gray
+            Write-Host "  Jitter: $($result.Jitter)ms - $($result.JitterRating)" -ForegroundColor $color
+            Write-Host "  Packet Loss: $($result.PacketLoss)%" -ForegroundColor $(if ($result.PacketLoss -eq 0) { "Green" } else { "Yellow" })
+        }
+        else {
+            if ($result.ICMPBlocked) {
+                Write-Host "  [ICMP BLOCKED] Host reachable via TCP but not responding to ping" -ForegroundColor Yellow
+                Write-Host "  $($result.ICMPBlockedReason)" -ForegroundColor Gray
+            }
+            else {
+                Write-Host "  Failed: $($result.Error)" -ForegroundColor Red
+                if ($result.ICMPBlockedReason) {
+                    Write-Host "  $($result.ICMPBlockedReason)" -ForegroundColor Gray
+                }
+            }
+        }
+        Write-Host ""
+    }
+    
+    # Summary
+    $successResults = $results | Where-Object { $_.Success }
+    if ($successResults.Count -gt 0) {
+        $overallJitter = [math]::Round(($successResults | Measure-Object -Property Jitter -Average).Average, 2)
+        $overallLatency = [math]::Round(($successResults | Measure-Object -Property AvgLatency -Average).Average, 2)
+        $maxPacketLoss = ($successResults | Measure-Object -Property PacketLoss -Maximum).Maximum
+        
+        Write-Host "Summary" -ForegroundColor Cyan
+        Write-Host "=======" -ForegroundColor Cyan
+        Write-Host "  Average Jitter: ${overallJitter}ms" -ForegroundColor White
+        Write-Host "  Average Latency: ${overallLatency}ms" -ForegroundColor White
+        Write-Host "  Max Packet Loss: ${maxPacketLoss}%" -ForegroundColor White
+        
+        # Check for ICMP blocked endpoints
+        $icmpBlockedResults = $results | Where-Object { $_.ICMPBlocked }
+        if ($icmpBlockedResults.Count -gt 0) {
+            Write-Host "  ICMP Blocked: $($icmpBlockedResults.Count) endpoint(s)" -ForegroundColor Yellow
+        }
+        
+        # Teams quality assessment
+        Write-Host ""
+        if ($overallJitter -lt 30 -and $overallLatency -lt 100 -and $maxPacketLoss -lt 1) {
+            Write-Host "[OK] Network quality is suitable for Microsoft Teams calls" -ForegroundColor Green
+        }
+        elseif ($overallJitter -lt 50 -and $overallLatency -lt 150 -and $maxPacketLoss -lt 5) {
+            Write-Host "[!] Network quality may cause minor Teams call issues" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "[!!] Network quality may cause significant Teams call issues" -ForegroundColor Red
+        }
+        
+        # Note about ICMP blocking
+        if ($icmpBlockedResults.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Note: $($icmpBlockedResults.Count) endpoint(s) block ICMP/ping." -ForegroundColor Gray
+            Write-Host "This prevents jitter measurement but doesn't affect Teams calls (uses UDP/TCP)." -ForegroundColor Gray
+        }
+    }
+    
+    Write-Host ""
+    return $results
+}
+
+#endregion
+
 #region Shared Functions
 
 function Get-CertificateChain {
@@ -1618,6 +1931,148 @@ function Start-GUIMode {
                             <Border Grid.Row="1" Background="#1E1E1E" CornerRadius="4" Padding="10">
                                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                                     <TextBlock x:Name="txtHairpinDetails" 
+                                               Foreground="#CCCCCC" 
+                                               FontFamily="Consolas" 
+                                               FontSize="12"
+                                               TextWrapping="Wrap"/>
+                                </ScrollViewer>
+                            </Border>
+                        </Grid>
+                    </GroupBox>
+                </Grid>
+            </TabItem>
+            
+            <!-- Teams Jitter Test Tab -->
+            <TabItem Header="Teams Jitter">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    
+                    <!-- Description -->
+                    <StackPanel Grid.Row="0" Margin="0,0,0,15">
+                        <TextBlock Text="Microsoft Teams Jitter Test" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+                        <TextBlock Text="Test network jitter and latency to Microsoft Teams media endpoints for call quality assessment" 
+                                   Foreground="#888888" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    
+                    <!-- Configuration -->
+                    <Grid Grid.Row="1" Margin="0,0,0,15">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="350"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        
+                        <GroupBox Grid.Column="0" Header="Test Configuration">
+                            <StackPanel Margin="5">
+                                <TextBlock Text="Number of Pings per Endpoint:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <ComboBox x:Name="cmbJitterPingCount" SelectedIndex="1" Width="100" HorizontalAlignment="Left">
+                                    <ComboBoxItem Content="25 (Quick)"/>
+                                    <ComboBoxItem Content="50 (Standard)"/>
+                                    <ComboBoxItem Content="100 (Thorough)"/>
+                                </ComboBox>
+                                
+                                <CheckBox x:Name="chkTestAllRegions" Content="Test All Regional Endpoints" Margin="0,15,0,0" Foreground="#CCCCCC"/>
+                                <TextBlock Text="(Uncheck to test only global endpoints)" Foreground="#666666" FontSize="10" Margin="20,2,0,0"/>
+                                
+                                <Button x:Name="btnRunJitter" Content="Run Jitter Test" Margin="0,20,0,0" Padding="15,8"/>
+                                <TextBlock x:Name="txtJitterStatus" Text="" Foreground="#888888" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </GroupBox>
+                        
+                        <GroupBox Grid.Column="1" Header="Teams Call Quality Requirements" Margin="10,0,0,0">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <TextBlock Foreground="#AAAAAA" TextWrapping="Wrap" Margin="5">
+                                    <Run FontWeight="Bold">Microsoft Teams Network Requirements:</Run>
+                                    <LineBreak/><LineBreak/>
+                                    <Run FontWeight="Bold" Foreground="#4EC9B0">Jitter:</Run> &lt; 30ms recommended
+                                    <LineBreak/>
+                                    <Run FontWeight="Bold" Foreground="#4EC9B0">Latency:</Run> &lt; 100ms recommended
+                                    <LineBreak/>
+                                    <Run FontWeight="Bold" Foreground="#4EC9B0">Packet Loss:</Run> &lt; 1% recommended
+                                    <LineBreak/><LineBreak/>
+                                    <Run FontWeight="Bold">What is Jitter?</Run>
+                                    <LineBreak/>
+                                    Jitter is the variation in packet arrival times. High jitter 
+                                    causes choppy audio/video in Teams calls even when average 
+                                    latency is acceptable.
+                                    <LineBreak/><LineBreak/>
+                                    <Run FontWeight="Bold">Rating Scale:</Run>
+                                    <LineBreak/>
+                                    • Excellent: &lt; 10ms
+                                    <LineBreak/>
+                                    • Good: 10-20ms
+                                    <LineBreak/>
+                                    • Acceptable: 20-30ms
+                                    <LineBreak/>
+                                    • Poor: 30-50ms
+                                    <LineBreak/>
+                                    • Very Poor: &gt; 50ms
+                                </TextBlock>
+                            </ScrollViewer>
+                        </GroupBox>
+                    </Grid>
+                    
+                    <!-- Results -->
+                    <GroupBox Grid.Row="2" Header="Test Results">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            
+                            <!-- Summary -->
+                            <Grid Grid.Row="0" Margin="0,5,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                
+                                <Border Grid.Column="0" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Overall Quality" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterQuality" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="1" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Avg Jitter" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterAvg" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="2" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Avg Latency" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterLatency" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="3" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Packet Loss" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterLoss" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                                
+                                <Border Grid.Column="4" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                    <StackPanel>
+                                        <TextBlock Text="Endpoints" Foreground="#888888" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterEndpoints" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                            
+                            <!-- Details -->
+                            <Border Grid.Row="1" Background="#1E1E1E" CornerRadius="4" Padding="10">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                    <TextBlock x:Name="txtJitterDetails" 
                                                Foreground="#CCCCCC" 
                                                FontFamily="Consolas" 
                                                FontSize="12"
@@ -2395,6 +2850,166 @@ function Start-GUIMode {
         }
         finally {
             $btnRunHairpin.IsEnabled = $true
+        }
+    })
+
+    # Teams Jitter Test - Run Test button
+    $btnRunJitter.Add_Click({
+        # Get ping count from combo box
+        $pingCount = switch ($cmbJitterPingCount.SelectedIndex) {
+            0 { 25 }
+            1 { 50 }
+            2 { 100 }
+            default { 50 }
+        }
+        
+        $testAllRegions = $chkTestAllRegions.IsChecked
+        
+        # Update UI
+        $btnRunJitter.IsEnabled = $false
+        $txtJitterStatus.Text = "Running jitter test..."
+        $txtJitterQuality.Text = "Testing..."
+        $txtJitterAvg.Text = "-"
+        $txtJitterLatency.Text = "-"
+        $txtJitterLoss.Text = "-"
+        $txtJitterEndpoints.Text = "-"
+        $txtJitterDetails.Text = ""
+        $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        
+        try {
+            # Get endpoints to test
+            $endpointsToTest = if ($testAllRegions) {
+                $script:TeamsMediaEndpoints
+            } else {
+                $script:TeamsMediaEndpoints | Where-Object { $_.Region -eq "Global" }
+            }
+            
+            $results = @()
+            $endpointCount = $endpointsToTest.Count
+            $currentEndpoint = 0
+            
+            foreach ($endpoint in $endpointsToTest) {
+                $currentEndpoint++
+                $txtJitterStatus.Text = "Testing [$currentEndpoint/$endpointCount]: $($endpoint.Host)..."
+                $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+                
+                $result = Test-NetworkJitter -Target $endpoint.Host -Description $endpoint.Description -PingCount $pingCount
+                $results += $result
+            }
+            
+            # Calculate summary
+            $successResults = $results | Where-Object { $_.Success }
+            $txtJitterEndpoints.Text = "$($successResults.Count)/$($results.Count)"
+            
+            if ($successResults.Count -gt 0) {
+                $overallJitter = [math]::Round(($successResults | Measure-Object -Property Jitter -Average).Average, 2)
+                $overallLatency = [math]::Round(($successResults | Measure-Object -Property AvgLatency -Average).Average, 2)
+                $maxPacketLoss = ($successResults | Measure-Object -Property PacketLoss -Maximum).Maximum
+                
+                $txtJitterAvg.Text = "${overallJitter}ms"
+                $txtJitterLatency.Text = "${overallLatency}ms"
+                $txtJitterLoss.Text = "${maxPacketLoss}%"
+                
+                # Determine overall quality
+                if ($overallJitter -lt 10 -and $overallLatency -lt 50 -and $maxPacketLoss -lt 0.5) {
+                    $txtJitterQuality.Text = "Excellent"
+                    $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::LightGreen
+                }
+                elseif ($overallJitter -lt 20 -and $overallLatency -lt 100 -and $maxPacketLoss -lt 1) {
+                    $txtJitterQuality.Text = "Good"
+                    $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::LightGreen
+                }
+                elseif ($overallJitter -lt 30 -and $overallLatency -lt 150 -and $maxPacketLoss -lt 2) {
+                    $txtJitterQuality.Text = "Acceptable"
+                    $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::Yellow
+                }
+                elseif ($overallJitter -lt 50 -and $overallLatency -lt 200 -and $maxPacketLoss -lt 5) {
+                    $txtJitterQuality.Text = "Poor"
+                    $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::Orange
+                }
+                else {
+                    $txtJitterQuality.Text = "Very Poor"
+                    $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::Red
+                }
+                
+                # Build detailed output
+                $details = @()
+                $details += "Microsoft Teams Jitter Test Results"
+                $details += "===================================="
+                $details += "Test Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                $details += "Pings per endpoint: $pingCount"
+                $details += ""
+                $details += "=== SUMMARY ==="
+                $details += "Average Jitter: ${overallJitter}ms"
+                $details += "Average Latency: ${overallLatency}ms"
+                $details += "Max Packet Loss: ${maxPacketLoss}%"
+                $details += "Endpoints Tested: $($successResults.Count)/$($results.Count)"
+                $details += ""
+                
+                # Quality assessment
+                if ($overallJitter -lt 30 -and $overallLatency -lt 100 -and $maxPacketLoss -lt 1) {
+                    $details += "[OK] Network quality is suitable for Microsoft Teams calls"
+                }
+                elseif ($overallJitter -lt 50 -and $overallLatency -lt 150 -and $maxPacketLoss -lt 5) {
+                    $details += "[!] Network quality may cause minor Teams call issues"
+                }
+                else {
+                    $details += "[!!] Network quality may cause significant Teams call issues"
+                }
+                
+                $details += ""
+                $details += "=== ENDPOINT DETAILS ==="
+                
+                foreach ($r in $results) {
+                    $details += ""
+                    $details += "$($r.Description) ($($r.Target))"
+                    if ($r.Success) {
+                        $details += "  Latency: $($r.AvgLatency)ms (min: $($r.MinLatency)ms, max: $($r.MaxLatency)ms)"
+                        $details += "  Jitter: $($r.Jitter)ms - $($r.JitterRating)"
+                        $details += "  Packet Loss: $($r.PacketLoss)% ($($r.PingsReceived)/$($r.PingsSent) received)"
+                    }
+                    else {
+                        if ($r.ICMPBlocked) {
+                            $details += "  [ICMP BLOCKED] $($r.ICMPBlockedReason)"
+                            $details += "  Host reachable via TCP: Yes"
+                        }
+                        else {
+                            $details += "  [FAILED] $($r.Error)"
+                            if ($r.ICMPBlockedReason) {
+                                $details += "  Note: $($r.ICMPBlockedReason)"
+                            }
+                        }
+                    }
+                }
+                
+                # Check for any ICMP blocked endpoints
+                $icmpBlockedCount = ($results | Where-Object { $_.ICMPBlocked }).Count
+                if ($icmpBlockedCount -gt 0) {
+                    $details += ""
+                    $details += "=== ICMP BLOCKING DETECTED ==="
+                    $details += "$icmpBlockedCount endpoint(s) are blocking ICMP/ping."
+                    $details += "This prevents accurate jitter measurement but does not affect Teams calls."
+                    $details += "Teams uses UDP/TCP for media, not ICMP."
+                }
+                
+                $txtJitterDetails.Text = $details -join "`n"
+                $txtJitterStatus.Text = "Test completed"
+            }
+            else {
+                $txtJitterQuality.Text = "Failed"
+                $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::Red
+                $txtJitterDetails.Text = "All endpoint tests failed. Check network connectivity."
+                $txtJitterStatus.Text = "Test failed"
+            }
+        }
+        catch {
+            $txtJitterQuality.Text = "Error"
+            $txtJitterQuality.Foreground = [System.Windows.Media.Brushes]::Red
+            $txtJitterDetails.Text = "Error: $($_.Exception.Message)"
+            $txtJitterStatus.Text = "Error occurred"
+        }
+        finally {
+            $btnRunJitter.IsEnabled = $true
         }
     })
 
