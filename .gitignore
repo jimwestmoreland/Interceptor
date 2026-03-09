@@ -1,3 +1,5 @@
 # Archived files
 archive/
-Detect-Interception.txt
+
+# Text files
+*.txt
