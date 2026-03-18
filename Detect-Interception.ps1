@@ -103,6 +103,14 @@ param(
     [string]$OutputPath = $PWD.Path
 )
 
+# Force TLS 1.2 and TLS 1.3 for all connections
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    # TLS 1.3 may not be available on older systems, fall back to TLS 1.2
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
 #region Shared Configuration
 
 # Known Microsoft Root CA Thumbprints (these are legitimate Microsoft/DigiCert/Baltimore roots)
@@ -1314,7 +1322,9 @@ function Get-CertificateChain {
         )
         
         try {
-            $sslStream.AuthenticateAsClient($Hostname)
+            # Use TLS 1.2 and TLS 1.3 explicitly
+            $sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12 -bor [System.Security.Authentication.SslProtocols]::Tls13
+            $sslStream.AuthenticateAsClient($Hostname, $null, $sslProtocols, $false)
             
             $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($sslStream.RemoteCertificate)
             $result.Certificate = $cert
