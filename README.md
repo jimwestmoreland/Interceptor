@@ -14,11 +14,14 @@ This script tests endpoints commonly used by Azure Virtual Desktop (AVD), Micros
   - Microsoft 365 (Outlook, Teams, SharePoint, OneDrive, Graph API)
   - Azure (Entra ID, Management API, Key Vault, Blob Storage, SQL)
   - Tenant Restriction v2 / Global Secure Access (Device Registration, Seamless SSO, GSA Tunnel)
+  - Apple SSO Extension (Associated Domains, STS endpoints for Enterprise SSO on macOS/iOS)
 - **Live endpoint fetching** - Pull current M365 and Azure endpoint lists from official Microsoft JSON feeds
 - **Custom endpoint testing** - Test your own endpoints
 - **Certificate chain analysis** - Full certificate chain inspection with thumbprint verification
 - **Known CA validation** - Validates against Microsoft, DigiCert, Baltimore, and GlobalSign root CAs
 - **Root CA discovery** - Automatically detect and update the trusted root CA list
+- **Network Jitter Testing** - Measures latency variation, packet loss, and network quality for Microsoft Teams media endpoints
+- **Hairpin NAT Detection** - Detects NAT loopback scenarios by analyzing TTL, latency, and traceroute patterns
 - **Export results** - Save test results to file
 
 ## Usage
@@ -45,6 +48,12 @@ Use the `-NoGUI` switch to run in command-line mode:
 # Test TRv2 / Global Secure Access endpoints
 .\Detect-Interception.ps1 -NoGUI -TestTRv2
 
+# Test Apple SSO Extension endpoints (for macOS/iOS Enterprise SSO)
+.\Detect-Interception.ps1 -NoGUI -TestAppleSSO
+
+# Test for Hairpin NAT (NAT loopback detection)
+.\Detect-Interception.ps1 -NoGUI -TestHairpin
+
 # Test all categories
 .\Detect-Interception.ps1 -NoGUI -TestAll
 
@@ -57,6 +66,37 @@ Use the `-NoGUI` switch to run in command-line mode:
 
 # Save results to specific path
 .\Detect-Interception.ps1 -NoGUI -TestAll -OutputPath "C:\Logs"
+```
+
+### Network Jitter Testing
+
+The script includes a jitter test for Microsoft Teams media endpoints to assess network quality for real-time communications:
+
+```powershell
+# Test jitter to Teams media endpoints (via GUI Network Tests tab)
+# Measures: latency, jitter (standard deviation), packet loss
+# Provides Teams call quality assessment
+```
+
+**Jitter ratings:**
+- **Excellent** (< 10ms): Optimal for Teams calls
+- **Good** (10-20ms): Suitable for Teams calls
+- **Acceptable** (20-30ms): May experience minor issues
+- **Poor** (30-50ms): Likely to experience call quality issues
+- **Very Poor** (> 50ms): Significant call quality problems expected
+
+### Hairpin NAT Detection
+
+Hairpin NAT (NAT loopback) occurs when internal traffic destined for a public IP is routed back to an internal server. The script detects this by:
+
+1. **TTL Analysis** - Low hop counts with low latency indicate local routing
+2. **Latency Measurement** - Sub-millisecond latency suggests the target is on the local network
+3. **Traceroute Analysis** - Examines intermediate hops for private IP patterns
+4. **TCP Connection Testing** - Measures actual connection establishment time
+
+```powershell
+# Test for hairpin NAT
+.\Detect-Interception.ps1 -NoGUI -TestHairpin
 ```
 
 ### Root CA Discovery
@@ -91,6 +131,8 @@ Discovered CAs are:
 | `-TestMicrosoft365` | Test Microsoft 365 endpoints |
 | `-TestAzure` | Test Azure service endpoints |
 | `-TestTRv2` | Test Tenant Restriction v2 / Global Secure Access endpoints |
+| `-TestAppleSSO` | Test Apple SSO Extension endpoints (macOS/iOS Enterprise SSO) |
+| `-TestHairpin` | Test for hairpin NAT (NAT loopback) routing |
 | `-TestAll` | Test all endpoint categories |
 | `-FetchM365Endpoints` | Fetch live M365 endpoints from Microsoft |
 | `-FetchAzureEndpoints` | Fetch live Azure endpoints from Microsoft |
