@@ -13,6 +13,7 @@ This tool provides two main capabilities:
 ## Features
 
 ### SSL/TLS Interception Detection
+
 - **GUI and CLI modes** — Interactive graphical interface (default) or command-line automation
 - **Pre-configured endpoint categories:**
   - Azure Virtual Desktop (RDP Gateway, Broker, Diagnostics, KMS)
@@ -28,18 +29,19 @@ This tool provides two main capabilities:
 - **Export results** — Save test results to file
 
 ### M365 Network Connectivity Assessment
+
 A comprehensive assessment that runs 15 diagnostic tests:
 
 | # | Test | Description |
-|---|------|-------------|
+| --- | --- | --- |
 | 1 | Network Egress Geolocation | Public IP, ISP, city/region/country via ip-api.com |
 | 2 | Office Location & Egress Distance | Geocodes your office via Nominatim API, calculates distance to internet egress to detect WAN backhaul |
 | 3 | DNS Recursive Resolver | Identifies your DNS resolver and measures resolver latency |
 | 4 | DNS Performance | Resolution timing for key M365 hostnames with ratings |
-| 5 | VPN & Proxy Detection | Detects active VPN, proxy settings, PAC files, and per-workload split tunnel routing for M365 Optimize endpoints |
+| 5 | VPN & Proxy Detection | Detects active VPN, proxy settings, PAC files, and per-workload split tunnel routing |
 | 6 | Service Front Door Identification | Discovers Exchange, SharePoint, and Teams front door IPs, CNAMEs, and TCP latency |
-| 7 | Best Front Door Comparison | Compares in-use front doors against 20 known Microsoft front door regions to identify suboptimal routing |
-| 8 | HTTPS Endpoint Connectivity | Tests connectivity to live M365 endpoints (pulled from official JSON feed), categorizes as accessible/reachable/allow-list/blocked |
+| 7 | Best Front Door Comparison | Compares in-use front doors against 20 known Microsoft front door regions |
+| 8 | HTTPS Endpoint Connectivity | Tests connectivity to live M365 endpoints from official JSON feed |
 | 9 | SSL/TLS Interception Check | Verifies certificate chains on critical M365 endpoints |
 | 10 | Teams UDP Media Ports | Tests UDP 3478-3481 connectivity with TCP 443 fallback detection |
 | 11 | Teams Jitter & Packet Loss | Measures jitter, latency, and packet loss to Teams media relay endpoints |
@@ -49,18 +51,21 @@ A comprehensive assessment that runs 15 diagnostic tests:
 | 15 | TCP/TLS Negotiation | TLS version, cipher suite, and TCP window size analysis |
 
 ### Additional Network Tests
+
 - **Network Jitter Testing** — Measures latency variation, packet loss, and network quality for Teams media endpoints
 - **Hairpin NAT Detection** — Detects NAT loopback scenarios by analyzing TTL, latency, and traceroute patterns
 
 ## Usage
 
 ### GUI Mode (Default)
+
 ```powershell
 # Simply run the script - GUI launches by default
 .\Detect-Interception.ps1
 ```
 
 The GUI has seven tabs:
+
 - **SSL Endpoints** — Configure and run SSL/TLS interception tests
 - **SSL Results** — View interception scan results
 - **SSL Cert Details** — Inspect individual certificate chains
@@ -70,6 +75,7 @@ The GUI has seven tabs:
 - **Assessment** — Run the full M365 connectivity assessment
 
 ### M365 Assessment (CLI)
+
 ```powershell
 # Run assessment for Worldwide (commercial) geography
 .\Detect-Interception.ps1 -NoGUI -RunAssessment
@@ -82,6 +88,7 @@ The GUI has seven tabs:
 ```
 
 ### SSL/TLS Interception (CLI)
+
 ```powershell
 # Test AVD endpoints
 .\Detect-Interception.ps1 -NoGUI -TestAVD
@@ -113,17 +120,20 @@ The GUI has seven tabs:
 ```
 
 ### Hairpin NAT Detection
+
 ```powershell
 .\Detect-Interception.ps1 -NoGUI -TestHairpin
 ```
 
 Detects NAT loopback by:
+
 1. **TTL Analysis** — Low hop counts with low latency indicate local routing
 2. **Latency Measurement** — Sub-millisecond latency suggests the target is on the local network
 3. **Traceroute Analysis** — Examines intermediate hops for private IP patterns
 4. **TCP Connection Testing** — Measures actual connection establishment time
 
 ### Root CA Discovery
+
 ```powershell
 # Discover current root CAs and save to TrustedRootCAs.json
 .\Detect-Interception.ps1 -DiscoverRootCAs
@@ -135,7 +145,7 @@ Detects NAT loopback by:
 ## Parameters
 
 | Parameter | Description |
-|-----------|-------------|
+| --- | --- |
 | `-NoGUI` | Suppress GUI and run in command-line mode |
 | `-RunAssessment` | Run M365 network connectivity assessment |
 | `-Geography` | Cloud instance: `Worldwide` (default), `USGovDoD`, `USGovGCCHigh`, `China`, `Germany` |
@@ -180,7 +190,7 @@ The generated text report includes:
 ## External APIs Used
 
 | API | Purpose | Data Sent |
-|-----|---------|-----------|
+| --- | --- | --- |
 | [ip-api.com](http://ip-api.com) | Geolocation of public IPs (egress and front doors) | Public IP address |
 | [endpoints.office.com](https://endpoints.office.com) | Live M365 endpoint list | Cloud instance name |
 | [speed.cloudflare.com](https://speed.cloudflare.com) | Download speed test payload | None (download only) |
@@ -189,6 +199,7 @@ The generated text report includes:
 ## Detection Logic
 
 The SSL interception detector checks:
+
 1. **Certificate thumbprint** — Compares against known Microsoft root CA thumbprints
 2. **Issuer chain** — Validates the certificate issuer matches known Microsoft/partner CAs
 3. **Chain integrity** — Ensures the full certificate chain is trusted
@@ -198,12 +209,15 @@ If the certificate presented doesn't match known Microsoft root CAs (Microsoft, 
 ## Configuration Files
 
 ### TrustedRootCAs.json
+
 Additional trusted root CAs are stored in this JSON file in the script directory. This file is:
+
 - Created automatically when using `-DiscoverRootCAs` or the GUI discovery button
 - Loaded automatically on script startup
 - Merged with the built-in CA list
 
 Example format:
+
 ```json
 {
   "DigiCert Global Root G2": "DF3C24F9BFD666761B268073FE06D1CC8D4F82A4",

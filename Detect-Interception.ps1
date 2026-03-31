@@ -1610,22 +1610,29 @@ function Get-BestFrontDoors {
         }
 
         $isOptimal = $false
+        $rating = "Unknown"
         if ($fdDistFromEgress -ne $null -and $closestDist -ne $null) {
             # If in-use front door is within 200km of the best possible, consider it optimal
             $isOptimal = ($fdDistFromEgress -le ($closestDist + 200))
+            $rating = if ($isOptimal) { "Optimal - front door is near the closest Microsoft region" }
+                      elseif ($fdDistFromEgress -lt 1500) { "Acceptable - consider network routing" }
+                      else { "Suboptimal - significant distance from nearest Microsoft region" }
+        } elseif ($closestRegion) {
+            # We have egress info + closest region but couldn't geolocate the front door IP
+            $rating = "Unable to geolocate front door IP for comparison"
         }
 
         $results += [PSCustomObject]@{
-            Service            = $fd.Service
-            InUseFrontDoor     = $fd.FrontDoorCNAME
-            InUseFrontDoorIP   = $fd.FrontDoorIP
-            InUseLocation      = $fdCity
-            InUseDistanceKm    = $fdDistFromEgress
-            BestRegion         = $closestRegion.Name
-            BestRegionCity     = $closestRegion.City
-            BestRegionDistKm   = $closestDist
-            IsOptimal          = $isOptimal
-            TCPLatencyMs       = $fd.TCPLatencyMs
+            Service              = $fd.Service
+            CurrentFrontDoor     = $fd.FrontDoorCNAME
+            CurrentFrontDoorIP   = $fd.FrontDoorIP
+            CurrentLocation      = $fdCity
+            DistanceToFrontDoor  = if ($fdDistFromEgress) { [math]::Round($fdDistFromEgress, 0) } else { $null }
+            NearestRegion        = if ($closestRegion) { "$($closestRegion.Name) ($($closestRegion.City))" } else { "Unknown" }
+            NearestRegionDistance = if ($closestDist -lt [double]::MaxValue) { [math]::Round($closestDist, 0) } else { $null }
+            IsOptimal            = $isOptimal
+            Rating               = $rating
+            TCPLatencyMs         = $fd.TCPLatencyMs
         }
     }
 
@@ -1652,7 +1659,12 @@ function Get-ServiceFrontDoor {
         $dnsTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
 
         $cnames = @($dns | Where-Object { $_.QueryType -eq "CNAME" } | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)
-        $aRecords = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+        # CNAME-only queries don't return A records; resolve separately
+        $aRecords = @()
+        try {
+            $aResult = [System.Net.Dns]::GetHostAddresses($exchangeHost) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            if ($aResult) { $aRecords = @($aResult.ToString()) }
+        } catch { }
 
         # Measure TCP latency to Exchange front door
         $tcpLatency = Measure-TCPLatency -Hostname $exchangeHost -Port 443 -Count 5
@@ -1693,7 +1705,11 @@ function Get-ServiceFrontDoor {
         $dnsTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
 
         $cnames = @($dns | Where-Object { $_.QueryType -eq "CNAME" } | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)
-        $aRecords = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+        $aRecords = @()
+        try {
+            $aResult = [System.Net.Dns]::GetHostAddresses($spHost) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            if ($aResult) { $aRecords = @($aResult.ToString()) }
+        } catch { }
 
         $tcpLatency = Measure-TCPLatency -Hostname $spHost -Port 443 -Count 5
 
@@ -1733,7 +1749,11 @@ function Get-ServiceFrontDoor {
         $dnsTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
 
         $cnames = @($dns | Where-Object { $_.QueryType -eq "CNAME" } | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)
-        $aRecords = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+        $aRecords = @()
+        try {
+            $aResult = [System.Net.Dns]::GetHostAddresses($teamsHost) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            if ($aResult) { $aRecords = @($aResult.ToString()) }
+        } catch { }
 
         $tcpLatency = Measure-TCPLatency -Hostname $teamsHost -Port 443 -Count 5
 
@@ -2827,8 +2847,8 @@ function Export-AssessmentReport {
         foreach ($bfd in $Assessment.BestFrontDoors) {
             $statusIcon = if ($bfd.IsOptimal) { "[OK]" } else { "[!]" }
             [void]$sb.AppendLine("  $statusIcon $($bfd.Service)")
-            [void]$sb.AppendLine("      Current Front Door:   $($bfd.CurrentFrontDoorIP)")
-            if ($bfd.CurrentLocation) {
+            [void]$sb.AppendLine("      Current Front Door:   $($bfd.CurrentFrontDoor) ($($bfd.CurrentFrontDoorIP))")
+            if ($bfd.CurrentLocation -and $bfd.CurrentLocation -ne "Unknown") {
                 [void]$sb.AppendLine("      Front Door Location:  $($bfd.CurrentLocation)")
             }
             if ($bfd.DistanceToFrontDoor) {
