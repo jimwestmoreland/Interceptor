@@ -3653,13 +3653,13 @@ function Start-GUIMode {
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Detection Methods:</Run>
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ TTL analysis (low hop count to public IP)
+                                    * TTL analysis (low hop count to public IP)
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Latency comparison (sub-millisecond to public IP)
+                                    * Latency comparison (sub-millisecond to public IP)
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Traceroute showing only private hops
+                                    * Traceroute showing only private hops
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ TCP connection timing analysis
+                                    * TCP connection timing analysis
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Why it matters:</Run>
                                     <LineBreak/>
@@ -3790,15 +3790,15 @@ function Start-GUIMode {
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Rating Scale:</Run>
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Excellent: &lt; 10ms
+                                    * Excellent: &lt; 10ms
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Good: 10-20ms
+                                    * Good: 10-20ms
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Acceptable: 20-30ms
+                                    * Acceptable: 20-30ms
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Poor: 30-50ms
+                                    * Poor: 30-50ms
                                     <LineBreak/>
-                                    Ã¢â‚¬Â¢ Very Poor: &gt; 50ms
+                                    * Very Poor: &gt; 50ms
                                 </TextBlock>
                             </ScrollViewer>
                         </GroupBox>
@@ -3885,7 +3885,7 @@ function Start-GUIMode {
                     <!-- Description -->
                     <StackPanel Grid.Row="0" Margin="0,0,0,15">
                         <TextBlock Text="M365 Network Connectivity Assessment" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
-                        <TextBlock Text="Comprehensive assessment modeled after connectivity.office.com Ã¢â‚¬â€ DNS, front doors, latency, interception, Teams media, Copilot, VPN/proxy, and more" 
+                        <TextBlock Text="Comprehensive assessment modeled after connectivity.office.com - DNS, front doors, latency, interception, Teams media, Copilot, VPN/proxy, and more" 
                                    Foreground="Gray" Margin="0,5,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
                     
