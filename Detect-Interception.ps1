@@ -49,6 +49,17 @@
     If not specified, looks for 'TrustedRootCAs.json' in the script directory.
     Use with -DiscoverRootCAs to save discovered CAs to this file.
 
+.PARAMETER RunAssessment
+    Runs a comprehensive Microsoft 365 network connectivity assessment (DNS, TCP, latency,
+    egress, VPN/proxy, Teams UDP, SharePoint download speed, traceroute, Copilot, TLS).
+    Generates a text file report. Use with -Geography to select the target geography.
+
+.PARAMETER Geography
+    Microsoft 365 cloud instance for the network assessment. These are sovereign cloud
+    boundaries, not physical regions. All commercial tenants (regardless of region) use
+    "Worldwide". Valid values: Worldwide, USGovDoD, USGovGCCHigh, China, Germany.
+    Default is Worldwide.
+
 .PARAMETER CustomEndpoints
     Array of custom endpoints to test (e.g., @("contoso.com:443", "api.example.com:443"))
 
@@ -79,6 +90,14 @@
     .\Detect-Interception.ps1 -NoGUI -DiscoverRootCAs -RootCAConfigPath "C:\Config\MyRootCAs.json"
     Discovers root CAs and saves to a custom config file path
 
+.EXAMPLE
+    .\Detect-Interception.ps1 -NoGUI -RunAssessment
+    Runs a full M365 network connectivity assessment for the Worldwide geography
+
+.EXAMPLE
+    .\Detect-Interception.ps1 -NoGUI -RunAssessment -Geography "USGovGCCHigh"
+    Runs a network connectivity assessment targeting US Government GCC High endpoints
+
 .NOTES
     Author: AVD Diagnostics Team
     Version: 1.0
@@ -98,6 +117,9 @@ param(
     [switch]$FetchM365Endpoints,
     [switch]$FetchAzureEndpoints,
     [switch]$DiscoverRootCAs,
+    [switch]$RunAssessment,
+    [ValidateSet("Worldwide","USGovDoD","USGovGCCHigh","China","Germany")]
+    [string]$Geography = "Worldwide",
     [string]$RootCAConfigPath,
     [string[]]$CustomEndpoints,
     [string]$OutputPath = $PWD.Path
@@ -1285,6 +1307,1569 @@ function Test-TeamsJitter {
 
 #endregion
 
+#region Microsoft Cloud Instances
+
+# Microsoft publishes M365 endpoints per cloud instance at:
+#   https://endpoints.office.com/endpoints/{Instance}?clientrequestid={GUID}
+#
+# These are cloud instance boundaries (sovereign clouds), NOT physical regions.
+# All commercial tenants worldwide (North America, Europe, Asia, etc.) use the
+# "Worldwide" instance. The instance determines WHICH endpoints to connect to.
+#
+# Supported cloud instances (the only valid values for the endpoints API):
+#   Worldwide     - Commercial / global tenants (default). Covers all regions
+#                   including NAM, EUR, APC, AUS, CAN, FRA, GBR, IND, JPN, etc.
+#   USGovDoD      - US Government Department of Defense (DoD) cloud
+#   USGovGCCHigh  - US Government GCC High cloud
+#   China         - Microsoft 365 operated by 21Vianet (Gallatin)
+#   Germany       - Microsoft Cloud Germany (deprecated, retained for legacy)
+#
+# NOTE: These are different from Microsoft 365 Multi-Geo data residency
+# geographies (NAM, EUR, APC, AUS, CAN, FRA, DEU, GBR, IND, JPN, KOR, BRA,
+# ZAF, ARE, QAT, NOR, SWE, CHE, etc.). Multi-Geo controls where customer
+# data is stored at rest, but does NOT change which network endpoints are used.
+# All Multi-Geo regions within commercial M365 use the "Worldwide" endpoints.
+#
+# Reference: https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-endpoints
+# Multi-Geo: https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-multi-geo
+$script:MicrosoftGeographies = @{
+    "Worldwide"    = @{ Label = "Worldwide (Commercial)"; EndpointInstance = "Worldwide"; Description = "Microsoft 365 Worldwide - all commercial regions (NAM, EUR, APC, etc.)" }
+    "USGovDoD"     = @{ Label = "US Gov DoD"; EndpointInstance = "USGovDoD"; Description = "Microsoft 365 US Government DoD" }
+    "USGovGCCHigh" = @{ Label = "US Gov GCC High"; EndpointInstance = "USGovGCCHigh"; Description = "Microsoft 365 US Government GCC High" }
+    "China"        = @{ Label = "China (21Vianet)"; EndpointInstance = "China"; Description = "Microsoft 365 operated by 21Vianet (Gallatin)" }
+    "Germany"      = @{ Label = "Germany (Legacy)"; EndpointInstance = "Germany"; Description = "Microsoft Cloud Germany (deprecated)" }
+}
+
+#endregion
+
+#region Assessment Test Functions
+
+function Test-DNSPerformance {
+    <#
+    .SYNOPSIS
+        Tests DNS resolution performance for key M365/Azure endpoints
+    #>
+    param(
+        [string[]]$Hostnames = @(
+            "login.microsoftonline.com",
+            "outlook.office365.com",
+            "teams.microsoft.com",
+            "graph.microsoft.com",
+            "management.azure.com",
+            "sharepoint.com"
+        )
+    )
+
+    $results = @()
+    $dnsServer = $null
+
+    # Identify the configured DNS server
+    try {
+        $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+        if ($adapters) {
+            foreach ($adapter in $adapters) {
+                $dnsServers = (Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+                if ($dnsServers) {
+                    $dnsServer = $dnsServers[0]
+                    break
+                }
+            }
+        }
+    } catch { }
+
+    foreach ($hostname in $Hostnames) {
+        $measurements = @()
+        $resolvedIPs = @()
+        $success = $true
+        $errorMsg = $null
+
+        for ($i = 0; $i -lt 3; $i++) {
+            try {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $dns = Resolve-DnsName -Name $hostname -Type A -DnsOnly -ErrorAction Stop
+                $sw.Stop()
+                $measurements += $sw.Elapsed.TotalMilliseconds
+                $resolvedIPs = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+            } catch {
+                $sw.Stop()
+                $measurements += $sw.Elapsed.TotalMilliseconds
+                $success = $false
+                $errorMsg = $_.Exception.Message
+            }
+        }
+
+        $avgMs = [math]::Round(($measurements | Measure-Object -Average).Average, 2)
+        $minMs = [math]::Round(($measurements | Measure-Object -Minimum).Minimum, 2)
+        $maxMs = [math]::Round(($measurements | Measure-Object -Maximum).Maximum, 2)
+
+        # Rating thresholds
+        $rating = if ($avgMs -lt 10) { "Excellent" }
+                  elseif ($avgMs -lt 50) { "Good" }
+                  elseif ($avgMs -lt 100) { "Acceptable" }
+                  elseif ($avgMs -lt 200) { "Poor" }
+                  else { "Very Poor" }
+
+        $results += [PSCustomObject]@{
+            Hostname    = $hostname
+            Success     = $success
+            AvgMs       = $avgMs
+            MinMs       = $minMs
+            MaxMs       = $maxMs
+            Rating      = $rating
+            ResolvedIPs = $resolvedIPs
+            Error       = $errorMsg
+        }
+    }
+
+    return [PSCustomObject]@{
+        DNSServer = $dnsServer
+        Results   = $results
+    }
+}
+
+function Get-NetworkEgressInfo {
+    <#
+    .SYNOPSIS
+        Gets network egress IP and geolocation data
+    #>
+    $info = [PSCustomObject]@{
+        PublicIP         = $null
+        City             = $null
+        Region           = $null
+        Country          = $null
+        ISP              = $null
+        Org              = $null
+        Latitude         = $null
+        Longitude        = $null
+        Success          = $false
+        Error            = $null
+    }
+
+    try {
+        # Use ip-api.com (free, no key required, includes geolocation)
+        $response = Invoke-RestMethod -Uri "http://ip-api.com/json/?fields=status,message,country,regionName,city,lat,lon,isp,org,query" -TimeoutSec 10 -ErrorAction Stop
+        if ($response.status -eq "success") {
+            $info.PublicIP   = $response.query
+            $info.City       = $response.city
+            $info.Region     = $response.regionName
+            $info.Country    = $response.country
+            $info.ISP        = $response.isp
+            $info.Org        = $response.org
+            $info.Latitude   = $response.lat
+            $info.Longitude  = $response.lon
+            $info.Success    = $true
+        } else {
+            $info.Error = $response.message
+        }
+    } catch {
+        # Fallback to just getting IP
+        $info.Error = $_.Exception.Message
+        try {
+            $ip = Get-PublicIPAddress
+            if ($ip) {
+                $info.PublicIP = $ip
+                $info.Success = $true
+            }
+        } catch { }
+    }
+
+    return $info
+}
+
+function Get-ServiceFrontDoor {
+    <#
+    .SYNOPSIS
+        Identifies the Microsoft 365 service front door for Exchange and SharePoint
+    #>
+    param(
+        [string]$TenantDomain
+    )
+
+    $results = @()
+
+    # Exchange front door
+    $exchangeHost = "outlook.office365.com"
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $dns = Resolve-DnsName -Name $exchangeHost -Type CNAME -DnsOnly -ErrorAction Stop
+        $sw.Stop()
+        $dnsTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+
+        $cnames = @($dns | Where-Object { $_.QueryType -eq "CNAME" } | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)
+        $aRecords = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+
+        # Measure TCP latency to Exchange front door
+        $tcpLatency = Measure-TCPLatency -Hostname $exchangeHost -Port 443 -Count 5
+
+        $results += [PSCustomObject]@{
+            Service       = "Exchange Online"
+            Hostname      = $exchangeHost
+            FrontDoorCNAME = if ($cnames.Count -gt 0) { $cnames[0] } else { "N/A" }
+            FrontDoorIP   = if ($aRecords.Count -gt 0) { $aRecords[0] } else { "N/A" }
+            DNSTimeMs     = $dnsTimeMs
+            TCPLatencyMs  = $tcpLatency.AvgMs
+            MinLatencyMs  = $tcpLatency.MinMs
+            MaxLatencyMs  = $tcpLatency.MaxMs
+            Success       = $true
+            Error         = $null
+        }
+    } catch {
+        $results += [PSCustomObject]@{
+            Service       = "Exchange Online"
+            Hostname      = $exchangeHost
+            FrontDoorCNAME = "N/A"
+            FrontDoorIP   = "N/A"
+            DNSTimeMs     = 0
+            TCPLatencyMs  = 0
+            MinLatencyMs  = 0
+            MaxLatencyMs  = 0
+            Success       = $false
+            Error         = $_.Exception.Message
+        }
+    }
+
+    # SharePoint front door
+    $spHost = if ($TenantDomain) { "$TenantDomain.sharepoint.com" } else { "microsoft.sharepoint.com" }
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $dns = Resolve-DnsName -Name $spHost -Type CNAME -DnsOnly -ErrorAction Stop
+        $sw.Stop()
+        $dnsTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+
+        $cnames = @($dns | Where-Object { $_.QueryType -eq "CNAME" } | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)
+        $aRecords = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+
+        $tcpLatency = Measure-TCPLatency -Hostname $spHost -Port 443 -Count 5
+
+        $results += [PSCustomObject]@{
+            Service       = "SharePoint Online"
+            Hostname      = $spHost
+            FrontDoorCNAME = if ($cnames.Count -gt 0) { $cnames[0] } else { "N/A" }
+            FrontDoorIP   = if ($aRecords.Count -gt 0) { $aRecords[0] } else { "N/A" }
+            DNSTimeMs     = $dnsTimeMs
+            TCPLatencyMs  = $tcpLatency.AvgMs
+            MinLatencyMs  = $tcpLatency.MinMs
+            MaxLatencyMs  = $tcpLatency.MaxMs
+            Success       = $true
+            Error         = $null
+        }
+    } catch {
+        $results += [PSCustomObject]@{
+            Service       = "SharePoint Online"
+            Hostname      = $spHost
+            FrontDoorCNAME = "N/A"
+            FrontDoorIP   = "N/A"
+            DNSTimeMs     = 0
+            TCPLatencyMs  = 0
+            MinLatencyMs  = 0
+            MaxLatencyMs  = 0
+            Success       = $false
+            Error         = $_.Exception.Message
+        }
+    }
+
+    # Teams front door
+    $teamsHost = "world.tr.teams.microsoft.com"
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $dns = Resolve-DnsName -Name $teamsHost -Type CNAME -DnsOnly -ErrorAction Stop
+        $sw.Stop()
+        $dnsTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+
+        $cnames = @($dns | Where-Object { $_.QueryType -eq "CNAME" } | Select-Object -ExpandProperty NameHost -ErrorAction SilentlyContinue)
+        $aRecords = @($dns | Where-Object { $_.QueryType -eq "A" } | Select-Object -ExpandProperty IPAddress -ErrorAction SilentlyContinue)
+
+        $tcpLatency = Measure-TCPLatency -Hostname $teamsHost -Port 443 -Count 5
+
+        $results += [PSCustomObject]@{
+            Service       = "Microsoft Teams"
+            Hostname      = $teamsHost
+            FrontDoorCNAME = if ($cnames.Count -gt 0) { $cnames[0] } else { "N/A" }
+            FrontDoorIP   = if ($aRecords.Count -gt 0) { $aRecords[0] } else { "N/A" }
+            DNSTimeMs     = $dnsTimeMs
+            TCPLatencyMs  = $tcpLatency.AvgMs
+            MinLatencyMs  = $tcpLatency.MinMs
+            MaxLatencyMs  = $tcpLatency.MaxMs
+            Success       = $true
+            Error         = $null
+        }
+    } catch {
+        $results += [PSCustomObject]@{
+            Service       = "Microsoft Teams"
+            Hostname      = $teamsHost
+            FrontDoorCNAME = "N/A"
+            FrontDoorIP   = "N/A"
+            DNSTimeMs     = 0
+            TCPLatencyMs  = 0
+            MinLatencyMs  = 0
+            MaxLatencyMs  = 0
+            Success       = $false
+            Error         = $_.Exception.Message
+        }
+    }
+
+    return $results
+}
+
+function Measure-TCPLatency {
+    <#
+    .SYNOPSIS
+        Measures TCP connection latency to a host:port
+    #>
+    param(
+        [string]$Hostname,
+        [int]$Port = 443,
+        [int]$Count = 5,
+        [int]$TimeoutMs = 5000
+    )
+
+    $measurements = @()
+    for ($i = 0; $i -lt $Count; $i++) {
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $task = $tcpClient.ConnectAsync($Hostname, $Port)
+            if ($task.Wait($TimeoutMs)) {
+                $sw.Stop()
+                $measurements += $sw.Elapsed.TotalMilliseconds
+            }
+            $tcpClient.Close()
+        } catch {
+            # Skip failed attempts
+        }
+    }
+
+    if ($measurements.Count -gt 0) {
+        return [PSCustomObject]@{
+            AvgMs = [math]::Round(($measurements | Measure-Object -Average).Average, 2)
+            MinMs = [math]::Round(($measurements | Measure-Object -Minimum).Minimum, 2)
+            MaxMs = [math]::Round(($measurements | Measure-Object -Maximum).Maximum, 2)
+            Count = $measurements.Count
+        }
+    } else {
+        return [PSCustomObject]@{
+            AvgMs = 0
+            MinMs = 0
+            MaxMs = 0
+            Count = 0
+        }
+    }
+}
+
+function Test-HTTPConnectivity {
+    <#
+    .SYNOPSIS
+        Tests HTTP/HTTPS reachability for endpoints on both port 80 and 443
+    #>
+    param(
+        [array]$Endpoints
+    )
+
+    $results = @()
+    foreach ($ep in $Endpoints) {
+        $hostname = $ep.Host
+        # Skip hostnames containing wildcards anywhere (e.g., *.example.com or autodiscover.*.onmicrosoft.com)
+        if ($hostname -match '\*') { continue }
+
+        # Test HTTPS (443) - only port that matters for M365
+        $httpsResult = $null
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $response = Invoke-WebRequest -Uri "https://$hostname" -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 0 -ErrorAction Stop
+            $sw.Stop()
+            $httpsResult = [PSCustomObject]@{
+                Port         = 443
+                StatusCode   = $response.StatusCode
+                LatencyMs    = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Success      = $true
+                Blocked      = $false
+                TCPReachable = $true
+                Error        = $null
+            }
+        } catch {
+            $sw.Stop()
+            $statusCode = 0
+            $blocked = $false
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                if ($statusCode -eq 407 -or $statusCode -eq 403) {
+                    $blocked = $true
+                }
+            }
+
+            # Determine TCP reachability: if we got an HTTP status code, TCP worked.
+            # Otherwise, try a raw TCP connect to port 443 as fallback.
+            $tcpReachable = $false
+            if ($statusCode -gt 0) {
+                $tcpReachable = $true
+            } elseif (-not $blocked) {
+                try {
+                    $tcpClient = New-Object System.Net.Sockets.TcpClient
+                    $task = $tcpClient.ConnectAsync($hostname, 443)
+                    if ($task.Wait(5000)) {
+                        $tcpReachable = $tcpClient.Connected
+                    }
+                    $tcpClient.Close()
+                } catch { }
+            }
+
+            $httpsResult = [PSCustomObject]@{
+                Port         = 443
+                StatusCode   = $statusCode
+                LatencyMs    = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Success      = ($statusCode -gt 0 -and $statusCode -lt 500 -and -not $blocked)
+                Blocked      = $blocked
+                TCPReachable = $tcpReachable
+                Error        = $_.Exception.Message
+            }
+        }
+
+        $results += [PSCustomObject]@{
+            Hostname    = $hostname
+            Description = $ep.Description
+            HTTPS       = $httpsResult
+        }
+    }
+
+    return $results
+}
+
+function Test-VPNAndProxy {
+    <#
+    .SYNOPSIS
+        Detects VPN connections and proxy configuration
+    #>
+    $result = [PSCustomObject]@{
+        VPNDetected      = $false
+        VPNAdapterName   = $null
+        VPNType          = $null
+        ProxyEnabled     = $false
+        ProxyServer      = $null
+        ProxyPACUrl      = $null
+        WinHTTPProxy     = $null
+        EnvProxy         = $null
+        SplitTunnelStatus = "Unknown"
+        Details          = @()
+    }
+
+    # Check for VPN adapters
+    try {
+        $vpnConnections = Get-VpnConnection -ErrorAction SilentlyContinue
+        if ($vpnConnections) {
+            $activeVPN = $vpnConnections | Where-Object { $_.ConnectionStatus -eq "Connected" }
+            if ($activeVPN) {
+                $result.VPNDetected = $true
+                $result.VPNAdapterName = $activeVPN[0].Name
+                $result.VPNType = $activeVPN[0].TunnelType
+                $result.Details += "VPN connected: $($activeVPN[0].Name) ($($activeVPN[0].TunnelType))"
+
+                # Check split tunnel
+                if ($activeVPN[0].SplitTunneling) {
+                    $result.SplitTunnelStatus = "Enabled"
+                    $result.Details += "Split tunneling: Enabled"
+                } else {
+                    $result.SplitTunnelStatus = "Disabled (Full Tunnel)"
+                    $result.Details += "Split tunneling: Disabled - all traffic goes through VPN"
+                }
+            }
+        }
+    } catch {
+        # VPN cmdlets may not be available
+    }
+
+    # Also check network adapters that look like VPN
+    try {
+        $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+        foreach ($adapter in $adapters) {
+            if ($adapter.InterfaceDescription -match "VPN|Virtual|Tunnel|TAP|WireGuard|Cisco|Palo Alto|Zscaler|GlobalProtect|AnyConnect|Fortinet|Juniper|Pulse") {
+                if (-not $result.VPNDetected) {
+                    $result.VPNDetected = $true
+                    $result.VPNAdapterName = $adapter.Name
+                    $result.VPNType = $adapter.InterfaceDescription
+                    $result.Details += "VPN adapter detected: $($adapter.Name) ($($adapter.InterfaceDescription))"
+                }
+            }
+        }
+    } catch { }
+
+    # Check IE/System proxy settings
+    try {
+        $proxyReg = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+        if ($proxyReg.ProxyEnable -eq 1) {
+            $result.ProxyEnabled = $true
+            $result.ProxyServer = $proxyReg.ProxyServer
+            $result.Details += "System proxy enabled: $($proxyReg.ProxyServer)"
+        }
+        if ($proxyReg.AutoConfigURL) {
+            $result.ProxyPACUrl = $proxyReg.AutoConfigURL
+            $result.Details += "PAC file configured: $($proxyReg.AutoConfigURL)"
+        }
+    } catch { }
+
+    # Check WinHTTP proxy
+    try {
+        $winhttp = netsh winhttp show proxy 2>$null
+        $proxyLine = $winhttp | Where-Object { $_ -match "Proxy Server" }
+        if ($proxyLine -and $proxyLine -notmatch "Direct access") {
+            $result.WinHTTPProxy = ($proxyLine -split ":\s+", 2)[1]
+            $result.Details += "WinHTTP proxy: $($result.WinHTTPProxy)"
+        }
+    } catch { }
+
+    # Check environment variables
+    $envProxy = $env:HTTPS_PROXY
+    if (-not $envProxy) { $envProxy = $env:HTTP_PROXY }
+    if ($envProxy) {
+        $result.EnvProxy = $envProxy
+        $result.Details += "Environment proxy: $envProxy"
+    }
+
+    if ($result.Details.Count -eq 0) {
+        $result.Details += "No VPN or proxy detected"
+    }
+
+    return $result
+}
+
+function Test-TeamsUDPConnectivity {
+    <#
+    .SYNOPSIS
+        Tests UDP connectivity on Teams media ports 3478-3481
+    #>
+    param(
+        [string]$Target = "13.107.64.1",
+        [int[]]$Ports = @(3478, 3479, 3480, 3481),
+        [int]$TimeoutMs = 3000
+    )
+
+    $results = @()
+    foreach ($port in $Ports) {
+        $success = $false
+        $latencyMs = 0
+        $errorMsg = $null
+
+        try {
+            $udpClient = New-Object System.Net.Sockets.UdpClient
+            $udpClient.Client.ReceiveTimeout = $TimeoutMs
+            
+            $payload = [byte[]]@(0x00, 0x01, 0x00, 0x00) + (1..12 | ForEach-Object { Get-Random -Minimum 0 -Maximum 256 })
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            [void]$udpClient.Send($payload, $payload.Length, $Target, $port)
+            
+            try {
+                $remoteEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+                $response = $udpClient.Receive([ref]$remoteEP)
+                $sw.Stop()
+                $success = $true
+                $latencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            } catch [System.Net.Sockets.SocketException] {
+                $sw.Stop()
+                # Timeout or port unreachable - UDP sent successfully but no response
+                # This doesn't necessarily mean blocked since STUN servers require proper requests
+                $latencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                $errorMsg = "No response (UDP may still be open)"
+            }
+            
+            $udpClient.Close()
+        } catch {
+            $errorMsg = $_.Exception.Message
+        }
+
+        # Also test TCP fallback on same port
+        $tcpFallback = $false
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $task = $tcpClient.ConnectAsync($Target, $port)
+            if ($task.Wait($TimeoutMs)) {
+                $tcpFallback = $true
+            }
+            $tcpClient.Close()
+        } catch { }
+
+        # Test TCP 443 fallback (the actual Teams fallback path)
+        $tcp443Fallback = $false
+        if (-not $success -and -not $tcpFallback) {
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $task = $tcpClient.ConnectAsync($Target, 443)
+                if ($task.Wait($TimeoutMs)) {
+                    $tcp443Fallback = $true
+                }
+                $tcpClient.Close()
+            } catch { }
+        }
+
+        $results += [PSCustomObject]@{
+            Port            = $port
+            UDPSuccess      = $success
+            UDPLatencyMs    = $latencyMs
+            TCPFallback     = $tcpFallback
+            TCP443Fallback  = $tcp443Fallback
+            Error           = $errorMsg
+        }
+    }
+
+    return $results
+}
+
+function Test-SharePointDownloadSpeed {
+    <#
+    .SYNOPSIS
+        Tests download speed and buffer bloat to SharePoint front door
+    #>
+    param(
+        [string]$TestUrl = "https://www.microsoft.com/favicon.ico",
+        [string]$SharePointHost = "microsoft.sharepoint.com",
+        [int]$Port = 443
+    )
+
+    $result = [PSCustomObject]@{
+        DownloadSpeedMBps = 0
+        DownloadSizeBytes = 0
+        DownloadTimeMs    = 0
+        LatencyBeforeMs   = 0
+        LatencyDuringMs   = 0
+        BufferBloatMs     = 0
+        BufferBloatRating = "N/A"
+        Success           = $false
+        Error             = $null
+    }
+
+    try {
+        # Measure latency before download
+        $preLatency = Measure-TCPLatency -Hostname $SharePointHost -Port $Port -Count 5
+        $result.LatencyBeforeMs = $preLatency.AvgMs
+
+        # Download a test file
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $webClient = New-Object System.Net.WebClient
+        $data = $webClient.DownloadData($TestUrl)
+        $sw.Stop()
+
+        $result.DownloadSizeBytes = $data.Length
+        $result.DownloadTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+
+        if ($sw.Elapsed.TotalSeconds -gt 0) {
+            $result.DownloadSpeedMBps = [math]::Round(($data.Length / 1MB) / $sw.Elapsed.TotalSeconds, 3)
+        }
+
+        # Measure latency during/after download (to detect buffer bloat)
+        $postLatency = Measure-TCPLatency -Hostname $SharePointHost -Port $Port -Count 5
+        $result.LatencyDuringMs = $postLatency.AvgMs
+
+        $result.BufferBloatMs = [math]::Round($result.LatencyDuringMs - $result.LatencyBeforeMs, 2)
+        $result.BufferBloatRating = if ($result.BufferBloatMs -lt 10) { "Excellent" }
+                                    elseif ($result.BufferBloatMs -lt 50) { "Good" }
+                                    elseif ($result.BufferBloatMs -lt 100) { "Acceptable" }
+                                    else { "Poor - Buffer Bloat Detected" }
+
+        $result.Success = $true
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Invoke-ServiceTraceroute {
+    <#
+    .SYNOPSIS
+        Runs traceroute to Exchange, SharePoint, and Teams front doors.
+        Uses TCP-based connectivity test and incremental-TTL traceroute
+        to avoid hanging on networks where ICMP is blocked.
+    #>
+    param(
+        [string]$TenantDomain,
+        [int]$MaxHops = 30,
+        [int]$TimeoutMs = 2000
+    )
+
+    $targets = @(
+        @{ Service = "Exchange Online"; Host = "outlook.office365.com" }
+        @{ Service = "SharePoint Online"; Host = if ($TenantDomain) { "$TenantDomain.sharepoint.com" } else { "microsoft.sharepoint.com" } }
+        @{ Service = "Microsoft Teams"; Host = "world.tr.teams.microsoft.com" }
+    )
+
+    $results = @()
+    foreach ($target in $targets) {
+        $hops = @()
+        $resolvedIP = "N/A"
+        $tcpSuccess = $false
+        try {
+            # Resolve the hostname first
+            $dnsResult = [System.Net.Dns]::GetHostAddresses($target.Host) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            if ($dnsResult) {
+                $resolvedIP = $dnsResult.ToString()
+            }
+
+            # TCP connectivity test (port 443) with timeout - no ICMP
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $connectTask = $tcpClient.ConnectAsync($target.Host, 443)
+                $tcpSuccess = $connectTask.Wait($TimeoutMs)
+                $tcpClient.Close()
+            } catch { $tcpSuccess = $false }
+
+            # Traceroute using ping with incremental TTL (with short timeout per hop)
+            for ($ttl = 1; $ttl -le $MaxHops; $ttl++) {
+                try {
+                    $pinger = New-Object System.Net.NetworkInformation.Ping
+                    $options = New-Object System.Net.NetworkInformation.PingOptions($ttl, $true)
+                    $reply = $pinger.Send($resolvedIP, $TimeoutMs, [byte[]]::new(32), $options)
+                    $pinger.Dispose()
+
+                    $hopAddr = if ($reply.Address) { $reply.Address.ToString() } else { "*" }
+                    $hops += [PSCustomObject]@{
+                        Hop       = $ttl
+                        Address   = $hopAddr
+                        IsPrivate = ($hopAddr -match "^10\." -or $hopAddr -match "^172\.(1[6-9]|2[0-9]|3[01])\." -or $hopAddr -match "^192\.168\.")
+                    }
+
+                    # Stop if we reached the destination
+                    if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { break }
+                } catch {
+                    $hops += [PSCustomObject]@{ Hop = $ttl; Address = "*"; IsPrivate = $false }
+                }
+            }
+
+            $results += [PSCustomObject]@{
+                Service          = $target.Service
+                Hostname         = $target.Host
+                ResolvedIP       = $resolvedIP
+                Hops             = $hops
+                HopCount         = $hops.Count
+                TCPTestSucceeded = $tcpSuccess
+                PingSucceeded    = ($hops | Where-Object { $_.Address -eq $resolvedIP }).Count -gt 0
+                Success          = $true
+                Error            = $null
+            }
+        } catch {
+            $results += [PSCustomObject]@{
+                Service          = $target.Service
+                Hostname         = $target.Host
+                ResolvedIP       = $resolvedIP
+                Hops             = @()
+                HopCount         = 0
+                TCPTestSucceeded = $false
+                PingSucceeded    = $false
+                Success          = $false
+                Error            = $_.Exception.Message
+            }
+        }
+    }
+
+    return $results
+}
+
+function Test-CopilotConnectivity {
+    <#
+    .SYNOPSIS
+        Tests Microsoft 365 Copilot HTTP and WebSocket connectivity
+    #>
+    $results = [PSCustomObject]@{
+        HTTPEndpoints = @()
+        WebSocketTest = $null
+        LatencyMs     = 0
+    }
+
+    # Copilot-related endpoints
+    $copilotEndpoints = @(
+        @{ Host = "substrate.office.com"; Description = "Substrate (Copilot backend)" }
+        @{ Host = "copilot.microsoft.com"; Description = "Copilot portal" }
+        @{ Host = "edge.microsoft.com"; Description = "Edge / Copilot services" }
+        @{ Host = "business.bing.com"; Description = "Copilot commercial search" }
+    )
+
+    foreach ($ep in $copilotEndpoints) {
+        $epResult = [PSCustomObject]@{
+            Host      = $ep.Host
+            Description = $ep.Description
+            Success   = $false
+            LatencyMs = 0
+            Error     = $null
+        }
+
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $task = $tcpClient.ConnectAsync($ep.Host, 443)
+            if ($task.Wait(5000)) {
+                $sw.Stop()
+                $epResult.Success = $true
+                $epResult.LatencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            } else {
+                $sw.Stop()
+                $epResult.Error = "Connection timed out"
+            }
+            $tcpClient.Close()
+        } catch {
+            $epResult.Error = $_.Exception.Message
+        }
+
+        $results.HTTPEndpoints += $epResult
+    }
+
+    # WebSocket test to Copilot endpoint
+    $wssResult = [PSCustomObject]@{
+        Success     = $false
+        LatencyMs   = 0
+        Error       = $null
+    }
+
+    try {
+        # Test WebSocket-capable endpoint via TLS handshake
+        $wssHost = "substrate.office.com"
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $task = $tcpClient.ConnectAsync($wssHost, 443)
+        if ($task.Wait(5000)) {
+            $sslStream = New-Object System.Net.Security.SslStream(
+                $tcpClient.GetStream(), $false,
+                { param($s, $c, $ch, $e) return $true }
+            )
+            $sslProtocols = [System.Security.Authentication.SslProtocols]::Tls12 -bor [System.Security.Authentication.SslProtocols]::Tls13
+            $sslStream.AuthenticateAsClient($wssHost, $null, $sslProtocols, $false)
+            
+            # Send WebSocket upgrade request
+            $upgradeRequest = "GET / HTTP/1.1`r`nHost: $wssHost`r`nUpgrade: websocket`r`nConnection: Upgrade`r`nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==`r`nSec-WebSocket-Version: 13`r`n`r`n"
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($upgradeRequest)
+            $sslStream.Write($bytes, 0, $bytes.Length)
+            $sslStream.Flush()
+
+            # Read response
+            $buffer = New-Object byte[] 4096
+            $sslStream.ReadTimeout = 5000
+            try {
+                $bytesRead = $sslStream.Read($buffer, 0, $buffer.Length)
+                $response = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $bytesRead)
+                $sw.Stop()
+
+                # WebSocket upgrade accepted = 101, but any response means TLS + HTTP works
+                $wssResult.Success = $true
+                $wssResult.LatencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+
+                if ($response -notmatch "101") {
+                    $wssResult.Error = "TLS connected but WebSocket upgrade not accepted (HTTP response received)"
+                }
+            } catch {
+                $sw.Stop()
+                $wssResult.Success = $true  # TLS connected successfully
+                $wssResult.LatencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                $wssResult.Error = "TLS connected but no WebSocket response"
+            }
+
+            $sslStream.Close()
+        } else {
+            $sw.Stop()
+            $wssResult.Error = "Connection timed out"
+        }
+        $tcpClient.Close()
+    } catch {
+        $wssResult.Error = $_.Exception.Message
+    }
+
+    $results.WebSocketTest = $wssResult
+    if ($results.HTTPEndpoints.Count -gt 0) {
+        $successEndpoints = $results.HTTPEndpoints | Where-Object { $_.Success }
+        if ($successEndpoints.Count -gt 0) {
+            $results.LatencyMs = [math]::Round(($successEndpoints | Measure-Object -Property LatencyMs -Average).Average, 2)
+        }
+    }
+
+    return $results
+}
+
+function Test-TCPNegotiation {
+    <#
+    .SYNOPSIS
+        Tests TCP options negotiation including window scaling, SACK, and MSS
+    #>
+    param(
+        [string]$Hostname = "outlook.office365.com",
+        [int]$Port = 443
+    )
+
+    $result = [PSCustomObject]@{
+        Hostname     = $Hostname
+        Port         = $Port
+        TLSVersion   = "Unknown"
+        TLS12Support = $false
+        TLS13Support = $false
+        CipherSuite  = "Unknown"
+        TCPWindowSize = 0
+        Success      = $false
+        Error        = $null
+    }
+
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $task = $tcpClient.ConnectAsync($Hostname, $Port)
+        if ($task.Wait(5000)) {
+            $result.TCPWindowSize = $tcpClient.ReceiveBufferSize
+
+            # Test TLS 1.2
+            try {
+                $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $true, { return $true })
+                $sslStream.AuthenticateAsClient($Hostname, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+                $result.TLS12Support = $true
+                $result.TLSVersion = "TLS 1.2"
+                $result.CipherSuite = $sslStream.CipherAlgorithm.ToString()
+                $sslStream.Close()
+            } catch { }
+
+            $tcpClient.Close()
+
+            # Test TLS 1.3 with new connection
+            try {
+                $tcpClient2 = New-Object System.Net.Sockets.TcpClient
+                $task2 = $tcpClient2.ConnectAsync($Hostname, $Port)
+                if ($task2.Wait(5000)) {
+                    $sslStream2 = New-Object System.Net.Security.SslStream($tcpClient2.GetStream(), $true, { return $true })
+                    $sslStream2.AuthenticateAsClient($Hostname, $null, [System.Security.Authentication.SslProtocols]::Tls13, $false)
+                    $result.TLS13Support = $true
+                    $result.TLSVersion = "TLS 1.3"
+                    $result.CipherSuite = $sslStream2.CipherAlgorithm.ToString()
+                    $sslStream2.Close()
+                }
+                $tcpClient2.Close()
+            } catch {
+                # TLS 1.3 not supported - that's OK
+            }
+
+            $result.Success = $true
+        } else {
+            $result.Error = "Connection timed out"
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Get-DNSRecursiveResolver {
+    <#
+    .SYNOPSIS
+        Identifies the DNS recursive resolver being used
+    #>
+    $result = [PSCustomObject]@{
+        ConfiguredDNS   = $null
+        RecursiveResolver = $null
+        ResolverIP      = $null
+        ResolverLatencyMs = 0
+        Success         = $false
+        Error           = $null
+    }
+
+    try {
+        # Get configured DNS server
+        $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+        if ($adapters) {
+            foreach ($adapter in $adapters) {
+                $dnsServers = (Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+                if ($dnsServers) {
+                    $result.ConfiguredDNS = $dnsServers[0]
+                    break
+                }
+            }
+        }
+
+        # Try to discover the actual recursive resolver using o-o.myaddr.l.google.com
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $resolverCheck = Resolve-DnsName -Name "o-o.myaddr.l.google.com" -Type TXT -DnsOnly -ErrorAction Stop
+            $sw.Stop()
+            $result.ResolverLatencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+            $txtRecords = @($resolverCheck | Where-Object { $_.QueryType -eq "TXT" } | Select-Object -ExpandProperty Strings -ErrorAction SilentlyContinue)
+            if ($txtRecords.Count -gt 0) {
+                $result.RecursiveResolver = $txtRecords[0]
+                $result.ResolverIP = $txtRecords[0]
+            }
+        } catch {
+            # Fallback - use configured DNS
+            $result.RecursiveResolver = $result.ConfiguredDNS
+            $result.ResolverIP = $result.ConfiguredDNS
+        }
+
+        $result.Success = $true
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Start-NetworkAssessment {
+    <#
+    .SYNOPSIS
+        Runs a comprehensive M365 network connectivity assessment
+    #>
+    param(
+        [string]$SelectedGeography = "Worldwide",
+        [string]$TenantDomain,
+        [scriptblock]$ProgressCallback
+    )
+
+    $assessmentResults = [PSCustomObject]@{
+        Timestamp          = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        ComputerName       = $env:COMPUTERNAME
+        UserName           = $env:USERNAME
+        Geography          = $SelectedGeography
+        TenantDomain       = $TenantDomain
+        NetworkEgress      = $null
+        DNSPerformance     = $null
+        DNSResolver        = $null
+        ServiceFrontDoors  = $null
+        HTTPConnectivity   = $null
+        SSLInterception    = $null
+        VPNProxy           = $null
+        TeamsUDP           = $null
+        TeamsJitter        = $null
+        SharePointSpeed    = $null
+        Traceroutes        = $null
+        CopilotConnectivity = $null
+        TCPNegotiation     = $null
+    }
+
+    $totalSteps = 13
+    $currentStep = 0
+
+    # Helper for progress
+    $reportProgress = {
+        param([string]$StepName)
+        $script:currentAssessmentStep++
+        if ($ProgressCallback) {
+            & $ProgressCallback $script:currentAssessmentStep $totalSteps $StepName
+        }
+    }
+    $script:currentAssessmentStep = 0
+
+    # Step 1: Network Egress
+    & $reportProgress "Detecting network egress location..."
+    $assessmentResults.NetworkEgress = Get-NetworkEgressInfo
+
+    # Step 2: DNS Resolver
+    & $reportProgress "Identifying DNS recursive resolver..."
+    $assessmentResults.DNSResolver = Get-DNSRecursiveResolver
+
+    # Step 3: DNS Performance
+    & $reportProgress "Testing DNS resolution performance..."
+    $assessmentResults.DNSPerformance = Test-DNSPerformance
+
+    # Step 4: VPN/Proxy Detection
+    & $reportProgress "Checking VPN and proxy configuration..."
+    $assessmentResults.VPNProxy = Test-VPNAndProxy
+
+    # Step 5: Service Front Doors
+    & $reportProgress "Identifying service front doors..."
+    $assessmentResults.ServiceFrontDoors = Get-ServiceFrontDoor -TenantDomain $TenantDomain
+
+    # Step 6: Fetch and test HTTP connectivity with live endpoints
+    & $reportProgress "Fetching endpoints and testing HTTP connectivity..."
+    $instance = $script:MicrosoftGeographies[$SelectedGeography].EndpointInstance
+    $liveEndpoints = Get-M365EndpointsFromMicrosoft -Instance $instance -RequiredOnly
+    # Take a representative sample for HTTP testing (capped for speed)
+    $httpSample = @()
+    $httpSample += $liveEndpoints | Select-Object -First 30
+    $assessmentResults.HTTPConnectivity = Test-HTTPConnectivity -Endpoints $httpSample
+
+    # Step 7: SSL Interception check on key endpoints
+    & $reportProgress "Testing SSL/TLS interception on key endpoints..."
+    $sslEndpoints = @(
+        @{ Host = "login.microsoftonline.com"; Port = 443; Description = "Entra ID" }
+        @{ Host = "outlook.office365.com"; Port = 443; Description = "Exchange Online" }
+        @{ Host = "teams.microsoft.com"; Port = 443; Description = "Microsoft Teams" }
+        @{ Host = "graph.microsoft.com"; Port = 443; Description = "Microsoft Graph" }
+        @{ Host = "management.azure.com"; Port = 443; Description = "Azure Management" }
+    )
+    $sslResults = @()
+    foreach ($ep in $sslEndpoints) {
+        $certResult = Get-CertificateChain -Hostname $ep.Host -Port $ep.Port
+        $sslResults += [PSCustomObject]@{
+            Hostname    = $ep.Host
+            Description = $ep.Description
+            Success     = $certResult.Success
+            IsIntercepted = $certResult.IsIntercepted
+            RootCA      = $certResult.RootCA
+            Error       = $certResult.Error
+        }
+    }
+    $assessmentResults.SSLInterception = $sslResults
+
+    # Step 8: Teams UDP
+    & $reportProgress "Testing Teams UDP connectivity (ports 3478-3481)..."
+    $assessmentResults.TeamsUDP = Test-TeamsUDPConnectivity
+
+    # Step 9: Teams Jitter (quick mode)
+    & $reportProgress "Testing Teams media jitter..."
+    $globalTeamsEndpoints = $script:TeamsMediaEndpoints | Where-Object { $_.Region -eq "Global" }
+    $jitterResults = @()
+    foreach ($ep in $globalTeamsEndpoints) {
+        $jitterResults += Test-NetworkJitter -Target $ep.Host -Description $ep.Description -PingCount 25
+    }
+    $assessmentResults.TeamsJitter = $jitterResults
+
+    # Step 10: SharePoint Speed
+    & $reportProgress "Testing download speed and buffer bloat..."
+    $spHost = if ($TenantDomain) { "$TenantDomain.sharepoint.com" } else { "microsoft.sharepoint.com" }
+    $assessmentResults.SharePointSpeed = Test-SharePointDownloadSpeed -SharePointHost $spHost
+
+    # Step 11: Traceroutes
+    & $reportProgress "Running traceroutes to service front doors..."
+    $assessmentResults.Traceroutes = Invoke-ServiceTraceroute -TenantDomain $TenantDomain
+
+    # Step 12: Copilot Connectivity
+    & $reportProgress "Testing Copilot connectivity and WebSocket..."
+    $assessmentResults.CopilotConnectivity = Test-CopilotConnectivity
+
+    # Step 13: TCP/TLS Negotiation
+    & $reportProgress "Testing TCP/TLS negotiation..."
+    $assessmentResults.TCPNegotiation = Test-TCPNegotiation
+
+    return $assessmentResults
+}
+
+function Export-AssessmentReport {
+    <#
+    .SYNOPSIS
+        Generates a comprehensive text report from assessment results
+    #>
+    param(
+        [PSCustomObject]$Assessment,
+        [string]$OutputPath
+    )
+
+    $sb = [System.Text.StringBuilder]::new()
+
+    [void]$sb.AppendLine("=" * 80)
+    [void]$sb.AppendLine("  Microsoft 365 Network Connectivity Assessment Report")
+    [void]$sb.AppendLine("=" * 80)
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("Generated:  $($Assessment.Timestamp)")
+    [void]$sb.AppendLine("Computer:   $($Assessment.ComputerName)")
+    [void]$sb.AppendLine("User:       $($Assessment.UserName)")
+    [void]$sb.AppendLine("Geography:  $($Assessment.Geography)")
+    if ($Assessment.TenantDomain) {
+        [void]$sb.AppendLine("Tenant:     $($Assessment.TenantDomain)")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- Network Egress ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  NETWORK EGRESS LOCATION")
+    [void]$sb.AppendLine("-" * 80)
+    $egress = $Assessment.NetworkEgress
+    if ($egress.Success) {
+        [void]$sb.AppendLine("  Public IP:   $($egress.PublicIP)")
+        [void]$sb.AppendLine("  Location:    $($egress.City), $($egress.Region), $($egress.Country)")
+        [void]$sb.AppendLine("  ISP:         $($egress.ISP)")
+        [void]$sb.AppendLine("  Org:         $($egress.Org)")
+    } else {
+        [void]$sb.AppendLine("  [X] Failed: $($egress.Error)")
+        if ($egress.PublicIP) { [void]$sb.AppendLine("  Public IP: $($egress.PublicIP) (geolocation unavailable)") }
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- DNS ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  DNS PERFORMANCE")
+    [void]$sb.AppendLine("-" * 80)
+    $dns = $Assessment.DNSPerformance
+    [void]$sb.AppendLine("  DNS Server: $($dns.DNSServer)")
+    $resolver = $Assessment.DNSResolver
+    if ($resolver.RecursiveResolver) {
+        [void]$sb.AppendLine("  Recursive Resolver: $($resolver.RecursiveResolver)")
+        [void]$sb.AppendLine("  Resolver Latency: $($resolver.ResolverLatencyMs)ms")
+    }
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("  Hostname                                  Avg(ms)    Min(ms)    Max(ms)       Rating")
+    [void]$sb.AppendLine("  " + ("-" * 86))
+    foreach ($r in $dns.Results) {
+        $status = if ($r.Success) { $r.Rating } else { "FAILED" }
+        $hn = "$($r.Hostname)".PadRight(40)
+        $avg = "$($r.AvgMs)".PadLeft(10)
+        $min = "$($r.MinMs)".PadLeft(10)
+        $max = "$($r.MaxMs)".PadLeft(10)
+        $rt = "$status".PadLeft(12)
+        [void]$sb.AppendLine("  $hn $avg $min $max $rt")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- VPN/Proxy ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  VPN AND PROXY DETECTION")
+    [void]$sb.AppendLine("-" * 80)
+    $vpn = $Assessment.VPNProxy
+    foreach ($detail in $vpn.Details) {
+        [void]$sb.AppendLine("  $detail")
+    }
+    if ($vpn.VPNDetected) {
+        [void]$sb.AppendLine("  Split Tunnel: $($vpn.SplitTunnelStatus)")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- Service Front Doors ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  SERVICE FRONT DOOR IDENTIFICATION")
+    [void]$sb.AppendLine("-" * 80)
+    foreach ($fd in $Assessment.ServiceFrontDoors) {
+        $status = if ($fd.Success) { "[OK]" } else { "[FAIL]" }
+        $latencyRating = if (-not $fd.Success) { "N/A" }
+                         elseif ($fd.TCPLatencyMs -lt 30) { "Excellent" }
+                         elseif ($fd.TCPLatencyMs -lt 60) { "Good" }
+                         elseif ($fd.TCPLatencyMs -lt 100) { "Acceptable" }
+                         else { "Poor" }
+        [void]$sb.AppendLine("  $status $($fd.Service)")
+        [void]$sb.AppendLine("      Hostname:   $($fd.Hostname)")
+        [void]$sb.AppendLine("      Front Door: $($fd.FrontDoorCNAME)")
+        [void]$sb.AppendLine("      IP:         $($fd.FrontDoorIP)")
+        [void]$sb.AppendLine("      DNS Time:   $($fd.DNSTimeMs)ms")
+        [void]$sb.AppendLine("      TCP Latency: $($fd.TCPLatencyMs)ms (min: $($fd.MinLatencyMs)ms, max: $($fd.MaxLatencyMs)ms)  [$latencyRating]")
+        if ($fd.Error) { [void]$sb.AppendLine("      Error: $($fd.Error)") }
+        [void]$sb.AppendLine("")
+    }
+
+    # ---- Location-Aware Analysis ----
+    if ($egress.Success -and $egress.Latitude -and $Assessment.ServiceFrontDoors.Count -gt 0) {
+        [void]$sb.AppendLine("-" * 80)
+        [void]$sb.AppendLine("  NETWORK PATH ANALYSIS")
+        [void]$sb.AppendLine("-" * 80)
+        [void]$sb.AppendLine("  You are egressing from: $($egress.City), $($egress.Region), $($egress.Country)")
+        [void]$sb.AppendLine("  ISP / Organization:     $($egress.ISP) / $($egress.Org)")
+        [void]$sb.AppendLine("")
+
+        foreach ($fd in ($Assessment.ServiceFrontDoors | Where-Object { $_.Success })) {
+            $fdLocation = $null
+            # Try to geolocate the front door IP
+            if ($fd.FrontDoorIP -and $fd.FrontDoorIP -ne "N/A") {
+                try {
+                    $fdGeo = Invoke-RestMethod -Uri "http://ip-api.com/json/$($fd.FrontDoorIP)?fields=status,city,regionName,country,lat,lon" -TimeoutSec 5 -ErrorAction Stop
+                    if ($fdGeo.status -eq "success" -and $fdGeo.lat) {
+                        $fdLocation = [PSCustomObject]@{ City = $fdGeo.city; Region = $fdGeo.regionName; Country = $fdGeo.country; Lat = $fdGeo.lat; Lon = $fdGeo.lon }
+                    }
+                } catch { }
+            }
+
+            if ($fdLocation) {
+                # Calculate distance using Haversine formula
+                $R = 6371 # Earth radius in km
+                $lat1 = [math]::PI * $egress.Latitude / 180
+                $lat2 = [math]::PI * $fdLocation.Lat / 180
+                $dLat = $lat2 - $lat1
+                $dLon = [math]::PI * ($fdLocation.Lon - $egress.Longitude) / 180
+                $a = [math]::Sin($dLat/2) * [math]::Sin($dLat/2) + [math]::Cos($lat1) * [math]::Cos($lat2) * [math]::Sin($dLon/2) * [math]::Sin($dLon/2)
+                $c = 2 * [math]::Atan2([math]::Sqrt($a), [math]::Sqrt(1 - $a))
+                $distKm = [math]::Round($R * $c, 0)
+                $distMi = [math]::Round($distKm * 0.621371, 0)
+
+                $rating = if ($distKm -lt 500) { "Optimal" } elseif ($distKm -lt 1500) { "Acceptable" } else { "Suboptimal - consider local internet egress" }
+
+                [void]$sb.AppendLine("  $($fd.Service):")
+                [void]$sb.AppendLine("      Front door location: $($fdLocation.City), $($fdLocation.Region), $($fdLocation.Country)")
+                [void]$sb.AppendLine("      Distance from egress: ~${distKm} km (~${distMi} mi)")
+                [void]$sb.AppendLine("      TCP Latency: $($fd.TCPLatencyMs)ms")
+                [void]$sb.AppendLine("      Routing Assessment: $rating")
+            } else {
+                [void]$sb.AppendLine("  $($fd.Service):")
+                [void]$sb.AppendLine("      Front door: $($fd.FrontDoorCNAME) ($($fd.FrontDoorIP))")
+                [void]$sb.AppendLine("      TCP Latency: $($fd.TCPLatencyMs)ms")
+                [void]$sb.AppendLine("      (Front door geolocation unavailable)")
+            }
+            [void]$sb.AppendLine("")
+        }
+    }
+
+    # ---- HTTPS Connectivity ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  HTTPS ENDPOINT CONNECTIVITY")
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  Note: Many M365 endpoints are included in the official endpoint list for")
+    [void]$sb.AppendLine("  firewall/proxy allow-listing and do not host web servers. Endpoints that")
+    [void]$sb.AppendLine("  are network-reachable (TCP port 443) but don't return a standard HTTP")
+    [void]$sb.AppendLine("  response are expected behavior and shown as 'Reachable' below.")
+    [void]$sb.AppendLine("")
+    $httpResults = $Assessment.HTTPConnectivity
+    $httpsAccessible = @($httpResults | Where-Object { $_.HTTPS.Success })
+    $tcpReachable    = @($httpResults | Where-Object { -not $_.HTTPS.Success -and -not $_.HTTPS.Blocked -and $_.HTTPS.TCPReachable })
+    $blocked         = @($httpResults | Where-Object { $_.HTTPS.Blocked })
+    $allowListOnly   = @($httpResults | Where-Object { -not $_.HTTPS.Success -and -not $_.HTTPS.Blocked -and -not $_.HTTPS.TCPReachable })
+    [void]$sb.AppendLine("  HTTPS (443):  $($httpsAccessible.Count) accessible, $($tcpReachable.Count) reachable (TCP), $($allowListOnly.Count) allow-list only, $($blocked.Count) blocked")
+    [void]$sb.AppendLine("")
+    if ($httpsAccessible.Count -gt 0) {
+        [void]$sb.AppendLine("  Accessible endpoints (HTTPS response received):")
+        foreach ($ep in $httpsAccessible) {
+            [void]$sb.AppendLine("    [OK] $($ep.Hostname) ($($ep.Description)) - HTTP $($ep.HTTPS.StatusCode), $($ep.HTTPS.LatencyMs)ms")
+        }
+        [void]$sb.AppendLine("")
+    }
+    if ($tcpReachable.Count -gt 0) {
+        [void]$sb.AppendLine("  Reachable endpoints (TCP port 443 open, no HTTP response):")
+        [void]$sb.AppendLine("  These endpoints are network-reachable but serve APIs or services that do")
+        [void]$sb.AppendLine("  not respond to bare HTTPS requests. This is normal.")
+        foreach ($ep in $tcpReachable) {
+            $detail = $ep.HTTPS.Error
+            # Simplify common error messages
+            if ($detail -match 'Operation is not valid') { $detail = 'Service responded but not with standard HTTP (API/redirect endpoint)' }
+            elseif ($detail -match 'trust relationship') { $detail = 'TLS handshake issue (expected for non-browser endpoints)' }
+            elseif ($detail -match 'timed out') { $detail = 'TCP connected but HTTPS handshake timed out' }
+            [void]$sb.AppendLine("    [~~] $($ep.Hostname) ($($ep.Description))")
+            [void]$sb.AppendLine("         $detail")
+        }
+        [void]$sb.AppendLine("")
+    }
+    if ($blocked.Count -gt 0) {
+        [void]$sb.AppendLine("  [!] BLOCKED by proxy (action required):")
+        [void]$sb.AppendLine("  These endpoints returned HTTP 403/407, indicating a proxy or firewall is")
+        [void]$sb.AppendLine("  actively blocking access. Add them to your allow list.")
+        foreach ($ep in $blocked) {
+            [void]$sb.AppendLine("    [BLOCKED] $($ep.Hostname) ($($ep.Description)) - HTTP $($ep.HTTPS.StatusCode)")
+        }
+        [void]$sb.AppendLine("")
+    }
+    if ($allowListOnly.Count -gt 0) {
+        [void]$sb.AppendLine("  Allow-list only endpoints (no direct connectivity expected):")
+        [void]$sb.AppendLine("  These domains exist in the M365 endpoint list for firewall/proxy allow-listing")
+        [void]$sb.AppendLine("  but do not resolve or accept connections directly. They may be mail-routing")
+        [void]$sb.AppendLine("  domains, CDN aliases, or service endpoints that require tenant-specific prefixes.")
+        foreach ($ep in $allowListOnly) {
+            $detail = $ep.HTTPS.Error
+            if ($detail -match 'could not be resolved') { $detail = 'DNS does not resolve (mail-routing or CDN alias domain)' }
+            elseif ($detail -match 'could not be parsed') { $detail = 'Hostname contains wildcard pattern (allow-list entry only)' }
+            elseif ($detail -match 'timed out') { $detail = 'No TCP listener on port 443 (allow-list entry only)' }
+            elseif ($detail -match 'actively refused') { $detail = 'Connection refused (service not hosted on this domain directly)' }
+            [void]$sb.AppendLine("    [--] $($ep.Hostname) ($($ep.Description))")
+            [void]$sb.AppendLine("         $detail")
+        }
+        [void]$sb.AppendLine("")
+    }
+
+    # ---- SSL Interception ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  SSL/TLS INTERCEPTION CHECK")
+    [void]$sb.AppendLine("-" * 80)
+    $intercepted = $Assessment.SSLInterception | Where-Object { $_.IsIntercepted }
+    if ($intercepted.Count -gt 0) {
+        [void]$sb.AppendLine("  [!!] INTERCEPTION DETECTED on $($intercepted.Count) endpoint(s):")
+        foreach ($ep in $intercepted) {
+            [void]$sb.AppendLine("    >>> $($ep.Description) ($($ep.Hostname)) - Root CA: $($ep.RootCA)")
+        }
+    } else {
+        $sslPass = ($Assessment.SSLInterception | Where-Object { $_.Success -and -not $_.IsIntercepted }).Count
+        $sslFail = ($Assessment.SSLInterception | Where-Object { -not $_.Success }).Count
+        [void]$sb.AppendLine("  [OK] No interception detected ($sslPass passed, $sslFail connection failures)")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- Copilot ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  MICROSOFT 365 COPILOT CONNECTIVITY")
+    [void]$sb.AppendLine("-" * 80)
+    $copilot = $Assessment.CopilotConnectivity
+    foreach ($ep in $copilot.HTTPEndpoints) {
+        $status = if ($ep.Success) { "[OK]" } else { "[FAIL]" }
+        [void]$sb.AppendLine("  $status $($ep.Description) ($($ep.Host)) - $($ep.LatencyMs)ms")
+        if ($ep.Error -and -not $ep.Success) { [void]$sb.AppendLine("      Error: $($ep.Error)") }
+    }
+    $wss = $copilot.WebSocketTest
+    $wssStatus = if ($wss.Success) { "[OK]" } else { "[FAIL]" }
+    [void]$sb.AppendLine("  $wssStatus WebSocket connectivity - $($wss.LatencyMs)ms")
+    if ($wss.Error) { [void]$sb.AppendLine("      Note: $($wss.Error)") }
+    if ($copilot.LatencyMs -gt 250) {
+        [void]$sb.AppendLine("  [!] Average Copilot latency ($($copilot.LatencyMs)ms) exceeds 250ms threshold")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- Teams Media ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  MICROSOFT TEAMS MEDIA CONNECTIVITY")
+    [void]$sb.AppendLine("-" * 80)
+    $udp = $Assessment.TeamsUDP
+    $udpOpen = @($udp | Where-Object { $_.UDPSuccess })
+    $udpBlockedWithFallback = @($udp | Where-Object { -not $_.UDPSuccess -and ($_.TCPFallback -or $_.TCP443Fallback) })
+    $udpFullyBlocked = @($udp | Where-Object { -not $_.UDPSuccess -and -not $_.TCPFallback -and -not $_.TCP443Fallback })
+    [void]$sb.AppendLine("  UDP Port Tests (target: 13.107.64.1):")
+    foreach ($p in $udp) {
+        $status = if ($p.UDPSuccess) { "[OK]" } elseif ($p.TCPFallback -or $p.TCP443Fallback) { "[TCP]" } else { "[FAIL]" }
+        $detail = if ($p.UDPSuccess) { "UDP OK ($($p.UDPLatencyMs)ms)" }
+                  elseif ($p.TCPFallback) { "UDP blocked, TCP fallback on port $($p.Port) available" }
+                  elseif ($p.TCP443Fallback) { "UDP blocked, TCP 443 fallback available" }
+                  else { "Blocked (no UDP or TCP path)" }
+        [void]$sb.AppendLine("    $status Port $($p.Port): $detail")
+    }
+    [void]$sb.AppendLine("")
+    if ($udpOpen.Count -eq 4) {
+        [void]$sb.AppendLine("  Rating: Optimal - all UDP ports open for best media quality")
+    } elseif ($udpBlockedWithFallback.Count -gt 0 -or $udpFullyBlocked.Count -gt 0) {
+        if ($udpBlockedWithFallback.Count -gt 0 -or ($udpFullyBlocked.Count -gt 0)) {
+            [void]$sb.AppendLine("  Rating: Acceptable - Teams will use TCP/HTTPS fallback")
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("  Note: UDP ports 3478-3481 are used by the Teams Transport Relay for")
+            [void]$sb.AppendLine("  real-time audio and video. When blocked (common on home networks and")
+            [void]$sb.AppendLine("  many corporate firewalls), Teams automatically falls back to TCP/HTTPS")
+            [void]$sb.AppendLine("  over port 443. Calls and meetings will work normally. Opening UDP ports")
+            [void]$sb.AppendLine("  to 13.107.64.0/18 and 52.112.0.0/14 can improve media quality and")
+            [void]$sb.AppendLine("  reduce latency for real-time communications.")
+        }
+    }
+    [void]$sb.AppendLine("")
+
+    # Jitter
+    $jitter = $Assessment.TeamsJitter
+    $successJitter = $jitter | Where-Object { $_.Success }
+    if ($successJitter.Count -gt 0) {
+        $avgJitter = [math]::Round(($successJitter | Measure-Object -Property Jitter -Average).Average, 2)
+        $avgLatency = [math]::Round(($successJitter | Measure-Object -Property AvgLatency -Average).Average, 2)
+        $maxLoss = ($successJitter | Measure-Object -Property PacketLoss -Maximum).Maximum
+        [void]$sb.AppendLine("  Jitter Test Results:")
+        [void]$sb.AppendLine("    Average Jitter:  ${avgJitter}ms $(if($avgJitter -lt 30){'[OK]'}else{'[!] Exceeds 30ms threshold'})")
+        [void]$sb.AppendLine("    Average Latency: ${avgLatency}ms $(if($avgLatency -lt 100){'[OK]'}else{'[!] Exceeds 100ms threshold'})")
+        [void]$sb.AppendLine("    Max Packet Loss: ${maxLoss}% $(if($maxLoss -lt 1){'[OK]'}else{'[!] Exceeds 1% threshold'})")
+    }
+    $icmpBlocked = $jitter | Where-Object { $_.ICMPBlocked }
+    if ($icmpBlocked.Count -gt 0) {
+        [void]$sb.AppendLine("    Note: $($icmpBlocked.Count) endpoint(s) blocked ICMP (does not affect Teams calls)")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- SharePoint Speed ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  SHAREPOINT DOWNLOAD SPEED AND BUFFER BLOAT")
+    [void]$sb.AppendLine("-" * 80)
+    $sp = $Assessment.SharePointSpeed
+    if ($sp.Success) {
+        $speedRating = if ($sp.DownloadSpeedMBps -ge 5) { "Excellent" }
+                       elseif ($sp.DownloadSpeedMBps -ge 1) { "Good" }
+                       elseif ($sp.DownloadSpeedMBps -ge 0.5) { "Acceptable" }
+                       else { "Poor" }
+        [void]$sb.AppendLine("  Download Speed:     $($sp.DownloadSpeedMBps) MB/s  [$speedRating]")
+        [void]$sb.AppendLine("  Download Size:      $($sp.DownloadSizeBytes) bytes in $($sp.DownloadTimeMs)ms")
+        [void]$sb.AppendLine("  Latency (idle):     $($sp.LatencyBeforeMs)ms")
+        [void]$sb.AppendLine("  Latency (loaded):   $($sp.LatencyDuringMs)ms")
+        [void]$sb.AppendLine("  Buffer Bloat:       $($sp.BufferBloatMs)ms - $($sp.BufferBloatRating)")
+    } else {
+        [void]$sb.AppendLine("  [X] Failed: $($sp.Error)")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- TCP/TLS ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  TCP/TLS NEGOTIATION")
+    [void]$sb.AppendLine("-" * 80)
+    $tcp = $Assessment.TCPNegotiation
+    if ($tcp.Success) {
+        $tlsRating = if ($tcp.TLS13Support) { "Excellent" }
+                     elseif ($tcp.TLS12Support) { "Good" }
+                     else { "Poor - outdated TLS version" }
+        [void]$sb.AppendLine("  Target:         $($tcp.Hostname):$($tcp.Port)")
+        [void]$sb.AppendLine("  TLS Version:    $($tcp.TLSVersion)")
+        [void]$sb.AppendLine("  TLS 1.2:        $(if($tcp.TLS12Support){'Supported'}else{'Not Supported'})")
+        [void]$sb.AppendLine("  TLS 1.3:        $(if($tcp.TLS13Support){'Supported'}else{'Not Supported'})")
+        [void]$sb.AppendLine("  Cipher:         $($tcp.CipherSuite)")
+        [void]$sb.AppendLine("  TCP Window:     $($tcp.TCPWindowSize) bytes")
+        [void]$sb.AppendLine("  Security Rating: $tlsRating")
+    } else {
+        [void]$sb.AppendLine("  [X] Failed: $($tcp.Error)")
+    }
+    [void]$sb.AppendLine("")
+
+    # ---- Traceroutes ----
+    [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("  TRACEROUTES TO SERVICE FRONT DOORS")
+    [void]$sb.AppendLine("-" * 80)
+    foreach ($tr in $Assessment.Traceroutes) {
+        $hopRating = if (-not $tr.TCPTestSucceeded) { "Unreachable" }
+                     elseif ($tr.HopCount -le 15) { "Good" }
+                     elseif ($tr.HopCount -le 20) { "Acceptable" }
+                     else { "High hop count - possible inefficient routing" }
+        [void]$sb.AppendLine("  $($tr.Service) ($($tr.Hostname) -> $($tr.ResolvedIP))")
+        [void]$sb.AppendLine("  TCP Test: $(if($tr.TCPTestSucceeded){'Pass'}else{'Fail'})  |  Hops: $($tr.HopCount)  [$hopRating]")
+        if ($tr.Hops.Count -gt 0) {
+            foreach ($hop in $tr.Hops) {
+                $marker = if ($hop.IsPrivate) { " [private]" } else { "" }
+                [void]$sb.AppendLine("    Hop $($hop.Hop): $($hop.Address)$marker")
+            }
+        }
+        if ($tr.Error) { [void]$sb.AppendLine("  Error: $($tr.Error)") }
+        [void]$sb.AppendLine("")
+    }
+
+    # ---- Summary ----
+    [void]$sb.AppendLine("=" * 80)
+    [void]$sb.AppendLine("  ASSESSMENT SUMMARY")
+    [void]$sb.AppendLine("=" * 80)
+
+    $issues = @()
+    if (($Assessment.SSLInterception | Where-Object { $_.IsIntercepted }).Count -gt 0) {
+        $issues += "[CRITICAL] SSL/TLS interception detected"
+    }
+    if ($Assessment.VPNProxy.VPNDetected -and $Assessment.VPNProxy.SplitTunnelStatus -eq "Disabled (Full Tunnel)") {
+        $issues += "[WARNING] VPN full tunnel detected - M365 Optimize traffic should be split tunneled"
+    }
+    if ($Assessment.VPNProxy.ProxyEnabled) {
+        $issues += "[INFO] Proxy server detected - ensure M365 Optimize/Allow endpoints bypass proxy"
+    }
+    $dnsSlowCount = ($Assessment.DNSPerformance.Results | Where-Object { $_.AvgMs -gt 100 }).Count
+    if ($dnsSlowCount -gt 0) {
+        $issues += "[WARNING] $dnsSlowCount endpoint(s) have DNS resolution > 100ms"
+    }
+    $udpBlocked = ($Assessment.TeamsUDP | Where-Object { -not $_.UDPSuccess }).Count
+    $hasTCPFallback = ($Assessment.TeamsUDP | Where-Object { -not $_.UDPSuccess -and ($_.TCPFallback -or $_.TCP443Fallback) }).Count -gt 0
+    if ($udpBlocked -gt 0) {
+        if ($hasTCPFallback) {
+            $issues += "[INFO] $udpBlocked Teams UDP port(s) blocked - Teams will use TCP/HTTPS fallback (calls still work)"
+        } else {
+            $issues += "[WARNING] $udpBlocked Teams UDP port(s) blocked with no TCP fallback detected"
+        }
+    }
+    $successJitter = $Assessment.TeamsJitter | Where-Object { $_.Success }
+    if ($successJitter.Count -gt 0) {
+        $avgJ = [math]::Round(($successJitter | Measure-Object -Property Jitter -Average).Average, 2)
+        if ($avgJ -gt 30) { $issues += "[WARNING] Teams jitter ($($avgJ)ms) exceeds 30ms threshold" }
+    }
+    if ($Assessment.SharePointSpeed.BufferBloatMs -gt 100) {
+        $issues += "[WARNING] Buffer bloat detected ($($Assessment.SharePointSpeed.BufferBloatMs)ms increase under load)"
+    }
+    $httpsBlocked = ($Assessment.HTTPConnectivity | Where-Object { $_.HTTPS.Blocked }).Count
+    if ($httpsBlocked -gt 0) {
+        $issues += "[CRITICAL] $httpsBlocked endpoint(s) blocked by proxy (HTTP 403/407)"
+    }
+    if ($Assessment.CopilotConnectivity.LatencyMs -gt 250) {
+        $issues += "[WARNING] Copilot latency ($($Assessment.CopilotConnectivity.LatencyMs)ms) exceeds 250ms threshold"
+    }
+    # Check for suboptimal front door distance
+    foreach ($fd in ($Assessment.ServiceFrontDoors | Where-Object { $_.Success -and $_.TCPLatencyMs -gt 100 })) {
+        $issues += "[WARNING] $($fd.Service) front door latency ($($fd.TCPLatencyMs)ms) exceeds 100ms - may indicate suboptimal routing"
+    }
+
+    if ($issues.Count -eq 0) {
+        [void]$sb.AppendLine("  [OK] No significant issues detected")
+    } else {
+        [void]$sb.AppendLine("  Issues found: $($issues.Count)")
+        [void]$sb.AppendLine("")
+        foreach ($issue in $issues) {
+            [void]$sb.AppendLine("  $issue")
+        }
+    }
+
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("=" * 80)
+    [void]$sb.AppendLine("  End of Report")
+    [void]$sb.AppendLine("=" * 80)
+
+    # Write to file
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $filename = "M365_Assessment_$timestamp.txt"
+    $filepath = Join-Path $OutputPath $filename
+    $sb.ToString() | Out-File -FilePath $filepath -Encoding UTF8
+
+    return [PSCustomObject]@{
+        FilePath = $filepath
+        Content  = $sb.ToString()
+    }
+}
+
+#endregion
+
 #region Shared Functions
 
 function Get-CertificateChain {
@@ -1442,155 +3027,19 @@ function Start-GUIMode {
     [xml]$XAML = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SSL/TLS Interception Detector" 
+        Title="Network Diagnostic Toolkit" 
         Height="950" Width="1150"
-        WindowStartupLocation="CenterScreen"
-        Background="#1E1E1E">
+        WindowStartupLocation="CenterScreen">
     <Window.Resources>
-        <!-- Dark Theme Colors -->
-        <SolidColorBrush x:Key="BackgroundBrush" Color="#1E1E1E"/>
-        <SolidColorBrush x:Key="SecondaryBackgroundBrush" Color="#252526"/>
-        <SolidColorBrush x:Key="BorderBrush" Color="#3C3C3C"/>
-        <SolidColorBrush x:Key="ForegroundBrush" Color="#CCCCCC"/>
+        <!-- Windows Default Light Theme Colors -->
+        <SolidColorBrush x:Key="BackgroundBrush" Color="{x:Static SystemColors.WindowColor}"/>
+        <SolidColorBrush x:Key="SecondaryBackgroundBrush" Color="{x:Static SystemColors.ControlColor}"/>
+        <SolidColorBrush x:Key="BorderBrush" Color="{x:Static SystemColors.ActiveBorderColor}"/>
+        <SolidColorBrush x:Key="ForegroundBrush" Color="{x:Static SystemColors.ControlTextColor}"/>
         <SolidColorBrush x:Key="AccentBrush" Color="#0078D4"/>
-        <SolidColorBrush x:Key="SuccessBrush" Color="#4EC9B0"/>
-        <SolidColorBrush x:Key="WarningBrush" Color="#FFCC00"/>
-        <SolidColorBrush x:Key="ErrorBrush" Color="#F14C4C"/>
-        
-        <!-- Button Style -->
-        <Style TargetType="Button">
-            <Setter Property="Background" Value="#0078D4"/>
-            <Setter Property="Foreground" Value="White"/>
-            <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="Padding" Value="15,8"/>
-            <Setter Property="Cursor" Value="Hand"/>
-            <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="Button">
-                        <Border Background="{TemplateBinding Background}" 
-                                CornerRadius="4" 
-                                Padding="{TemplateBinding Padding}">
-                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="Background" Value="#1084D8"/>
-                            </Trigger>
-                            <Trigger Property="IsPressed" Value="True">
-                                <Setter Property="Background" Value="#006CBD"/>
-                            </Trigger>
-                            <Trigger Property="IsEnabled" Value="False">
-                                <Setter Property="Background" Value="#555555"/>
-                                <Setter Property="Foreground" Value="#888888"/>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-        </Style>
-        
-        <!-- CheckBox Style -->
-        <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
-        </Style>
-        
-        <!-- TextBox Style -->
-        <Style TargetType="TextBox">
-            <Setter Property="Background" Value="#3C3C3C"/>
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Setter Property="BorderBrush" Value="#555555"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="5,3"/>
-            <Setter Property="CaretBrush" Value="#CCCCCC"/>
-        </Style>
-        
-        <!-- DataGrid Style -->
-        <Style TargetType="DataGrid">
-            <Setter Property="Background" Value="#252526"/>
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Setter Property="BorderBrush" Value="#3C3C3C"/>
-            <Setter Property="RowBackground" Value="#252526"/>
-            <Setter Property="AlternatingRowBackground" Value="#2D2D30"/>
-            <Setter Property="GridLinesVisibility" Value="Horizontal"/>
-            <Setter Property="HorizontalGridLinesBrush" Value="#3C3C3C"/>
-        </Style>
-        
-        <Style TargetType="DataGridColumnHeader">
-            <Setter Property="Background" Value="#3C3C3C"/>
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Setter Property="Padding" Value="8,5"/>
-            <Setter Property="BorderBrush" Value="#555555"/>
-            <Setter Property="BorderThickness" Value="0,0,1,1"/>
-        </Style>
-        
-        <Style TargetType="DataGridCell">
-            <Setter Property="BorderThickness" Value="0"/>
-            <Setter Property="Padding" Value="5,3"/>
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Style.Triggers>
-                <Trigger Property="IsSelected" Value="True">
-                    <Setter Property="Background" Value="#094771"/>
-                    <Setter Property="Foreground" Value="White"/>
-                </Trigger>
-            </Style.Triggers>
-        </Style>
-        
-        <Style TargetType="DataGridRow">
-            <Style.Triggers>
-                <Trigger Property="IsSelected" Value="True">
-                    <Setter Property="Background" Value="#094771"/>
-                </Trigger>
-                <DataTrigger Binding="{Binding StatusIcon}" Value="[WARN]">
-                    <Setter Property="Background" Value="#4D3D00"/>
-                    <Setter Property="Foreground" Value="#FFCC00"/>
-                </DataTrigger>
-                <DataTrigger Binding="{Binding StatusIcon}" Value="[FAIL]">
-                    <Setter Property="Background" Value="#4D1A1A"/>
-                    <Setter Property="Foreground" Value="#F14C4C"/>
-                </DataTrigger>
-            </Style.Triggers>
-        </Style>
-        
-        <!-- GroupBox Style -->
-        <Style TargetType="GroupBox">
-            <Setter Property="BorderBrush" Value="#3C3C3C"/>
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Setter Property="Padding" Value="10"/>
-            <Setter Property="Margin" Value="5"/>
-        </Style>
-        
-        <!-- TabControl Style -->
-        <Style TargetType="TabControl">
-            <Setter Property="Background" Value="#252526"/>
-            <Setter Property="BorderBrush" Value="#3C3C3C"/>
-        </Style>
-        
-        <Style TargetType="TabItem">
-            <Setter Property="Background" Value="#2D2D30"/>
-            <Setter Property="Foreground" Value="#CCCCCC"/>
-            <Setter Property="Padding" Value="15,8"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="TabItem">
-                        <Border Name="Border" Background="#2D2D30" BorderThickness="1,1,1,0" BorderBrush="#3C3C3C" Margin="0,0,2,0">
-                            <ContentPresenter x:Name="ContentSite" VerticalAlignment="Center" HorizontalAlignment="Center" 
-                                              ContentSource="Header" Margin="15,8"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsSelected" Value="True">
-                                <Setter TargetName="Border" Property="Background" Value="#252526"/>
-                                <Setter Property="Foreground" Value="#0078D4"/>
-                            </Trigger>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Border" Property="Background" Value="#3C3C3C"/>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-        </Style>
+        <SolidColorBrush x:Key="SuccessBrush" Color="#107C10"/>
+        <SolidColorBrush x:Key="WarningBrush" Color="#CA5010"/>
+        <SolidColorBrush x:Key="ErrorBrush" Color="#D13438"/>
     </Window.Resources>
     
     <Grid Margin="15">
@@ -1603,15 +3052,15 @@ function Start-GUIMode {
         
         <!-- Header -->
         <StackPanel Grid.Row="0" Margin="0,0,0,15">
-            <TextBlock Text="SSL/TLS Interception Detector" FontSize="24" FontWeight="Bold" Foreground="#0078D4"/>
-            <TextBlock Text="Detect proxy SSL inspection that may affect application connectivity" 
-                       FontSize="13" Foreground="#888888" Margin="0,5,0,0"/>
+            <TextBlock Text="Network Diagnostic Toolkit" FontSize="24" FontWeight="Bold" Foreground="#0078D4"/>
+            <TextBlock Text="SSL/TLS interception detection, network connectivity assessment, and diagnostic tools" 
+                       FontSize="13" Foreground="Gray" Margin="0,5,0,0"/>
         </StackPanel>
         
         <!-- Main Content -->
-        <TabControl Grid.Row="1">
+        <TabControl x:Name="mainTabControl" Grid.Row="1">
             <!-- Endpoints Tab -->
-            <TabItem Header="Endpoints">
+            <TabItem Header="SSL Endpoints">
                 <Grid Margin="10">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="250"/>
@@ -1628,28 +3077,28 @@ function Start-GUIMode {
                                 <CheckBox x:Name="chkAzure" Content="Azure Services" IsChecked="True" Margin="0,5"/>
                                 <CheckBox x:Name="chkTRv2" Content="TRv2 / Global Secure Access" IsChecked="True" Margin="0,5"/>
                                 <CheckBox x:Name="chkAppleSSO" Content="Apple SSO Extension" IsChecked="True" Margin="0,5"/>
-                                <Separator Margin="0,10" Background="#3C3C3C"/>
+                                <Separator Margin="0,10" Background="LightGray"/>
                                 <Button x:Name="btnSelectAll" Content="Select All" Margin="0,5"/>
-                                <Button x:Name="btnDeselectAll" Content="Deselect All" Margin="0,5" Background="#555555"/>
+                                <Button x:Name="btnDeselectAll" Content="Deselect All" Margin="0,5" Background="LightGray"/>
                             </StackPanel>
                         </GroupBox>
                         
                         <GroupBox Header="Fetch Live Endpoints" Margin="5,10,5,5">
                             <StackPanel>
-                                <TextBlock Text="Import from Microsoft:" Foreground="#CCCCCC" Margin="0,0,0,5"/>
+                                <TextBlock Text="Import from Microsoft:"  Margin="0,0,0,5"/>
                                 <Button x:Name="btnFetchM365" Content="Fetch M365 Endpoints" Margin="0,3" Background="#107C10"/>
                                 <Button x:Name="btnFetchAzure" Content="Fetch Azure Endpoints" Margin="0,3" Background="#107C10"/>
-                                <TextBlock x:Name="txtFetchStatus" Text="" Foreground="#888888" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="txtFetchStatus" Text="" Foreground="Gray" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
                         </GroupBox>
                         
                         <GroupBox Header="Add Custom Endpoint" Margin="5,10,5,5">
                             <StackPanel>
-                                <TextBlock Text="Hostname:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <TextBlock Text="Hostname:"  Margin="0,0,0,3"/>
                                 <TextBox x:Name="txtCustomHost" Margin="0,0,0,8"/>
-                                <TextBlock Text="Port:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <TextBlock Text="Port:"  Margin="0,0,0,3"/>
                                 <TextBox x:Name="txtCustomPort" Text="443" Margin="0,0,0,8"/>
-                                <TextBlock Text="Description:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <TextBlock Text="Description:"  Margin="0,0,0,3"/>
                                 <TextBox x:Name="txtCustomDesc" Margin="0,0,0,8"/>
                                 <Button x:Name="btnAddEndpoint" Content="Add Endpoint" Margin="0,5"/>
                             </StackPanel>
@@ -1657,13 +3106,13 @@ function Start-GUIMode {
                         
                         <GroupBox Header="Import Endpoints from File" Margin="5,10,5,5">
                             <StackPanel>
-                                <TextBlock Text="File format (CSV or TXT):" Foreground="#CCCCCC" Margin="0,0,0,3" FontWeight="Bold"/>
-                                <TextBlock Text="hostname,port,description" Foreground="#888888" FontSize="11" Margin="0,0,0,2"/>
-                                <TextBlock Text="Example:" Foreground="#888888" FontSize="10" Margin="0,3,0,0"/>
-                                <TextBlock Text="myapp.contoso.com,443,My App" Foreground="#6A9955" FontSize="10" FontFamily="Consolas"/>
-                                <TextBlock Text="api.example.com,8443,API" Foreground="#6A9955" FontSize="10" FontFamily="Consolas" Margin="0,0,0,8"/>
+                                <TextBlock Text="File format (CSV or TXT):"  Margin="0,0,0,3" FontWeight="Bold"/>
+                                <TextBlock Text="hostname,port,description" Foreground="Gray" FontSize="11" Margin="0,0,0,2"/>
+                                <TextBlock Text="Example:" Foreground="Gray" FontSize="10" Margin="0,3,0,0"/>
+                                <TextBlock Text="myapp.contoso.com,443,My App" Foreground="#107C10" FontSize="10" FontFamily="Consolas"/>
+                                <TextBlock Text="api.example.com,8443,API" Foreground="#107C10" FontSize="10" FontFamily="Consolas" Margin="0,0,0,8"/>
                                 <Button x:Name="btnImportFile" Content="Import from File..." Margin="0,5" Background="#0E639C"/>
-                                <TextBlock x:Name="txtImportStatus" Text="" Foreground="#888888" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="txtImportStatus" Text="" Foreground="Gray" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
                         </GroupBox>
                         
@@ -1692,7 +3141,7 @@ function Start-GUIMode {
             </TabItem>
             
             <!-- Results Tab -->
-            <TabItem Header="Results">
+            <TabItem Header="SSL Results">
                 <Grid Margin="10">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -1708,31 +3157,31 @@ function Start-GUIMode {
                             <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
                         
-                        <Border Grid.Column="0" Background="#252526" CornerRadius="8" Margin="5" Padding="15">
+                        <Border Grid.Column="0" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="15">
                             <StackPanel>
-                                <TextBlock Text="Total Tested" Foreground="#888888" FontSize="12"/>
-                                <TextBlock x:Name="txtTotalCount" Text="0" Foreground="#CCCCCC" FontSize="28" FontWeight="Bold"/>
+                                <TextBlock Text="Total Tested" Foreground="Gray" FontSize="12"/>
+                                <TextBlock x:Name="txtTotalCount" Text="0"  FontSize="28" FontWeight="Bold"/>
                             </StackPanel>
                         </Border>
                         
-                        <Border Grid.Column="1" Background="#252526" CornerRadius="8" Margin="5" Padding="15">
+                        <Border Grid.Column="1" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="15">
                             <StackPanel>
-                                <TextBlock Text="Trusted" Foreground="#888888" FontSize="12"/>
-                                <TextBlock x:Name="txtTrustedCount" Text="0" Foreground="#4EC9B0" FontSize="28" FontWeight="Bold"/>
+                                <TextBlock Text="Trusted" Foreground="Gray" FontSize="12"/>
+                                <TextBlock x:Name="txtTrustedCount" Text="0" Foreground="#107C10" FontSize="28" FontWeight="Bold"/>
                             </StackPanel>
                         </Border>
                         
-                        <Border Grid.Column="2" Background="#252526" CornerRadius="8" Margin="5" Padding="15">
+                        <Border Grid.Column="2" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="15">
                             <StackPanel>
-                                <TextBlock Text="Intercepted" Foreground="#888888" FontSize="12"/>
-                                <TextBlock x:Name="txtInterceptedCount" Text="0" Foreground="#FFCC00" FontSize="28" FontWeight="Bold"/>
+                                <TextBlock Text="Intercepted" Foreground="Gray" FontSize="12"/>
+                                <TextBlock x:Name="txtInterceptedCount" Text="0" Foreground="#CA5010" FontSize="28" FontWeight="Bold"/>
                             </StackPanel>
                         </Border>
                         
-                        <Border Grid.Column="3" Background="#252526" CornerRadius="8" Margin="5" Padding="15">
+                        <Border Grid.Column="3" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="15">
                             <StackPanel>
-                                <TextBlock Text="Failed" Foreground="#888888" FontSize="12"/>
-                                <TextBlock x:Name="txtFailedCount" Text="0" Foreground="#F14C4C" FontSize="28" FontWeight="Bold"/>
+                                <TextBlock Text="Failed" Foreground="Gray" FontSize="12"/>
+                                <TextBlock x:Name="txtFailedCount" Text="0" Foreground="#D13438" FontSize="28" FontWeight="Bold"/>
                             </StackPanel>
                         </Border>
                     </Grid>
@@ -1761,7 +3210,7 @@ function Start-GUIMode {
             </TabItem>
             
             <!-- Certificate Details Tab -->
-            <TabItem Header="Certificate Details">
+            <TabItem Header="SSL Cert Details">
                 <Grid Margin="10">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -1769,12 +3218,12 @@ function Start-GUIMode {
                     </Grid.RowDefinitions>
                     
                     <TextBlock Grid.Row="0" Text="Select a result to view certificate chain details" 
-                               Foreground="#888888" Margin="0,0,0,10"/>
+                               Foreground="Gray" Margin="0,0,0,10"/>
                     
-                    <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="15">
+                    <Border Grid.Row="1" Background="WhiteSmoke" CornerRadius="4" Padding="15">
                         <ScrollViewer VerticalScrollBarVisibility="Auto">
                             <TextBlock x:Name="txtCertDetails" 
-                                       Foreground="#CCCCCC" 
+                                        
                                        FontFamily="Consolas" 
                                        FontSize="12"
                                        TextWrapping="Wrap"/>
@@ -1784,7 +3233,7 @@ function Start-GUIMode {
             </TabItem>
             
             <!-- Known CAs Tab -->
-            <TabItem Header="Known Root CAs">
+            <TabItem Header="SSL Root CAs">
                 <Grid Margin="10">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -1793,7 +3242,7 @@ function Start-GUIMode {
                     </Grid.RowDefinitions>
                     
                     <TextBlock Grid.Row="0" Text="These are the trusted Microsoft root CAs used to detect SSL/TLS interception:" 
-                               Foreground="#AAAAAA" Margin="0,0,0,10"/>
+                               Foreground="Gray" Margin="0,0,0,10"/>
                     
                     <DataGrid x:Name="dgKnownCAs" Grid.Row="1"
                               AutoGenerateColumns="False" 
@@ -1810,7 +3259,7 @@ function Start-GUIMode {
                     
                     <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,10,0,0">
                         <Button x:Name="btnDiscoverCAs" Content="Discover &amp; Update Root CAs" Padding="15,8" Margin="0,0,10,0"/>
-                        <TextBlock x:Name="txtCAStatus" VerticalAlignment="Center" Foreground="#888888" Text=""/>
+                        <TextBlock x:Name="txtCAStatus" VerticalAlignment="Center" Foreground="Gray" Text=""/>
                     </StackPanel>
                 </Grid>
             </TabItem>
@@ -1828,7 +3277,7 @@ function Start-GUIMode {
                     <StackPanel Grid.Row="0" Margin="0,0,0,15">
                         <TextBlock Text="Hairpin NAT Detection" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
                         <TextBlock Text="Detect NAT loopback where traffic to your public IP is routed back internally" 
-                                   Foreground="#888888" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                   Foreground="Gray" Margin="0,5,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
                     
                     <!-- Configuration -->
@@ -1840,7 +3289,7 @@ function Start-GUIMode {
                         
                         <GroupBox Grid.Column="0" Header="Test Configuration">
                             <StackPanel Margin="5">
-                                <TextBlock Text="Target Public IP:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <TextBlock Text="Target Public IP:"  Margin="0,0,0,3"/>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
@@ -1850,20 +3299,20 @@ function Start-GUIMode {
                                     <Button x:Name="btnDetectIP" Grid.Column="1" Content="Auto-Detect" Padding="10,3" Background="#107C10"/>
                                 </Grid>
                                 
-                                <TextBlock Text="Port (optional):" Foreground="#CCCCCC" Margin="0,10,0,3"/>
+                                <TextBlock Text="Port (optional):"  Margin="0,10,0,3"/>
                                 <TextBox x:Name="txtHairpinPort" Text="443" Width="80" HorizontalAlignment="Left"/>
                                 
-                                <TextBlock Text="Internal Host (optional, for comparison):" Foreground="#CCCCCC" Margin="0,10,0,3"/>
+                                <TextBlock Text="Internal Host (optional, for comparison):"  Margin="0,10,0,3"/>
                                 <TextBox x:Name="txtHairpinInternal"/>
                                 
                                 <Button x:Name="btnRunHairpin" Content="Run Hairpin Test" Margin="0,15,0,0" Padding="15,8"/>
-                                <TextBlock x:Name="txtHairpinStatus" Text="" Foreground="#888888" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="txtHairpinStatus" Text="" Foreground="Gray" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
                         </GroupBox>
                         
                         <GroupBox Grid.Column="1" Header="What is Hairpin NAT?" Margin="10,0,0,0">
                             <ScrollViewer VerticalScrollBarVisibility="Auto">
-                                <TextBlock Foreground="#AAAAAA" TextWrapping="Wrap" Margin="5">
+                                <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="5">
                                     <Run FontWeight="Bold">Hairpin NAT</Run> (also called NAT loopback) occurs when:
                                     <LineBreak/><LineBreak/>
                                     1. An internal client sends traffic to a public IP
@@ -1874,13 +3323,13 @@ function Start-GUIMode {
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Detection Methods:</Run>
                                     <LineBreak/>
-                                    • TTL analysis (low hop count to public IP)
+                                    Ã¢â‚¬Â¢ TTL analysis (low hop count to public IP)
                                     <LineBreak/>
-                                    • Latency comparison (sub-millisecond to public IP)
+                                    Ã¢â‚¬Â¢ Latency comparison (sub-millisecond to public IP)
                                     <LineBreak/>
-                                    • Traceroute showing only private hops
+                                    Ã¢â‚¬Â¢ Traceroute showing only private hops
                                     <LineBreak/>
-                                    • TCP connection timing analysis
+                                    Ã¢â‚¬Â¢ TCP connection timing analysis
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Why it matters:</Run>
                                     <LineBreak/>
@@ -1908,40 +3357,40 @@ function Start-GUIMode {
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
                                 
-                                <Border Grid.Column="0" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="0" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Status" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtHairpinResult" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                        <TextBlock Text="Status" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinResult" Text="-"  FontSize="18" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="1" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="1" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Latency" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtHairpinLatency" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                        <TextBlock Text="Latency" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinLatency" Text="-"  FontSize="18" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="2" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="2" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Hops" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtHairpinHops" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                        <TextBlock Text="Hops" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinHops" Text="-"  FontSize="18" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="3" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="3" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Confidence" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtHairpinConfidence" Text="-" Foreground="#CCCCCC" FontSize="18" FontWeight="Bold"/>
+                                        <TextBlock Text="Confidence" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtHairpinConfidence" Text="-"  FontSize="18" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                             </Grid>
                             
                             <!-- Details -->
-                            <Border Grid.Row="1" Background="#1E1E1E" CornerRadius="4" Padding="10">
+                            <Border Grid.Row="1" Background="White" CornerRadius="4" Padding="10">
                                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                                     <TextBlock x:Name="txtHairpinDetails" 
-                                               Foreground="#CCCCCC" 
+                                                
                                                FontFamily="Consolas" 
                                                FontSize="12"
                                                TextWrapping="Wrap"/>
@@ -1965,7 +3414,7 @@ function Start-GUIMode {
                     <StackPanel Grid.Row="0" Margin="0,0,0,15">
                         <TextBlock Text="Microsoft Teams Jitter Test" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
                         <TextBlock Text="Test network jitter and latency to Microsoft Teams media endpoints for call quality assessment" 
-                                   Foreground="#888888" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                                   Foreground="Gray" Margin="0,5,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
                     
                     <!-- Configuration -->
@@ -1977,31 +3426,31 @@ function Start-GUIMode {
                         
                         <GroupBox Grid.Column="0" Header="Test Configuration">
                             <StackPanel Margin="5">
-                                <TextBlock Text="Number of Pings per Endpoint:" Foreground="#CCCCCC" Margin="0,0,0,3"/>
+                                <TextBlock Text="Number of Pings per Endpoint:"  Margin="0,0,0,3"/>
                                 <ComboBox x:Name="cmbJitterPingCount" SelectedIndex="1" Width="100" HorizontalAlignment="Left">
                                     <ComboBoxItem Content="25 (Quick)"/>
                                     <ComboBoxItem Content="50 (Standard)"/>
                                     <ComboBoxItem Content="100 (Thorough)"/>
                                 </ComboBox>
                                 
-                                <CheckBox x:Name="chkTestAllRegions" Content="Test All Regional Endpoints" Margin="0,15,0,0" Foreground="#CCCCCC"/>
-                                <TextBlock Text="(Uncheck to test only global endpoints)" Foreground="#666666" FontSize="10" Margin="20,2,0,0"/>
+                                <CheckBox x:Name="chkTestAllRegions" Content="Test All Regional Endpoints" Margin="0,15,0,0" />
+                                <TextBlock Text="(Uncheck to test only global endpoints)" Foreground="Gray" FontSize="10" Margin="20,2,0,0"/>
                                 
                                 <Button x:Name="btnRunJitter" Content="Run Jitter Test" Margin="0,20,0,0" Padding="15,8"/>
-                                <TextBlock x:Name="txtJitterStatus" Text="" Foreground="#888888" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="txtJitterStatus" Text="" Foreground="Gray" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
                         </GroupBox>
                         
                         <GroupBox Grid.Column="1" Header="Teams Call Quality Requirements" Margin="10,0,0,0">
                             <ScrollViewer VerticalScrollBarVisibility="Auto">
-                                <TextBlock Foreground="#AAAAAA" TextWrapping="Wrap" Margin="5">
+                                <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="5">
                                     <Run FontWeight="Bold">Microsoft Teams Network Requirements:</Run>
                                     <LineBreak/><LineBreak/>
-                                    <Run FontWeight="Bold" Foreground="#4EC9B0">Jitter:</Run> &lt; 30ms recommended
+                                    <Run FontWeight="Bold" Foreground="#107C10">Jitter:</Run> &lt; 30ms recommended
                                     <LineBreak/>
-                                    <Run FontWeight="Bold" Foreground="#4EC9B0">Latency:</Run> &lt; 100ms recommended
+                                    <Run FontWeight="Bold" Foreground="#107C10">Latency:</Run> &lt; 100ms recommended
                                     <LineBreak/>
-                                    <Run FontWeight="Bold" Foreground="#4EC9B0">Packet Loss:</Run> &lt; 1% recommended
+                                    <Run FontWeight="Bold" Foreground="#107C10">Packet Loss:</Run> &lt; 1% recommended
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">What is Jitter?</Run>
                                     <LineBreak/>
@@ -2011,15 +3460,15 @@ function Start-GUIMode {
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Rating Scale:</Run>
                                     <LineBreak/>
-                                    • Excellent: &lt; 10ms
+                                    Ã¢â‚¬Â¢ Excellent: &lt; 10ms
                                     <LineBreak/>
-                                    • Good: 10-20ms
+                                    Ã¢â‚¬Â¢ Good: 10-20ms
                                     <LineBreak/>
-                                    • Acceptable: 20-30ms
+                                    Ã¢â‚¬Â¢ Acceptable: 20-30ms
                                     <LineBreak/>
-                                    • Poor: 30-50ms
+                                    Ã¢â‚¬Â¢ Poor: 30-50ms
                                     <LineBreak/>
-                                    • Very Poor: &gt; 50ms
+                                    Ã¢â‚¬Â¢ Very Poor: &gt; 50ms
                                 </TextBlock>
                             </ScrollViewer>
                         </GroupBox>
@@ -2043,47 +3492,47 @@ function Start-GUIMode {
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
                                 
-                                <Border Grid.Column="0" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="0" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Overall Quality" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtJitterQuality" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                        <TextBlock Text="Overall Quality" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterQuality" Text="-"  FontSize="16" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="1" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="1" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Avg Jitter" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtJitterAvg" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                        <TextBlock Text="Avg Jitter" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterAvg" Text="-"  FontSize="16" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="2" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="2" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Avg Latency" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtJitterLatency" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                        <TextBlock Text="Avg Latency" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterLatency" Text="-"  FontSize="16" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="3" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="3" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Packet Loss" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtJitterLoss" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                        <TextBlock Text="Packet Loss" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterLoss" Text="-"  FontSize="16" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                                 
-                                <Border Grid.Column="4" Background="#252526" CornerRadius="8" Margin="5" Padding="10">
+                                <Border Grid.Column="4" Background="WhiteSmoke" CornerRadius="8" Margin="5" Padding="10">
                                     <StackPanel>
-                                        <TextBlock Text="Endpoints" Foreground="#888888" FontSize="11"/>
-                                        <TextBlock x:Name="txtJitterEndpoints" Text="-" Foreground="#CCCCCC" FontSize="16" FontWeight="Bold"/>
+                                        <TextBlock Text="Endpoints" Foreground="Gray" FontSize="11"/>
+                                        <TextBlock x:Name="txtJitterEndpoints" Text="-"  FontSize="16" FontWeight="Bold"/>
                                     </StackPanel>
                                 </Border>
                             </Grid>
                             
                             <!-- Details -->
-                            <Border Grid.Row="1" Background="#1E1E1E" CornerRadius="4" Padding="10">
+                            <Border Grid.Row="1" Background="White" CornerRadius="4" Padding="10">
                                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                                     <TextBlock x:Name="txtJitterDetails" 
-                                               Foreground="#CCCCCC" 
+                                                
                                                FontFamily="Consolas" 
                                                FontSize="12"
                                                TextWrapping="Wrap"/>
@@ -2093,15 +3542,114 @@ function Start-GUIMode {
                     </GroupBox>
                 </Grid>
             </TabItem>
+            
+            <!-- Assessment Tab -->
+            <TabItem Header="Assessment">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    
+                    <!-- Description -->
+                    <StackPanel Grid.Row="0" Margin="0,0,0,15">
+                        <TextBlock Text="M365 Network Connectivity Assessment" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+                        <TextBlock Text="Comprehensive assessment modeled after connectivity.office.com Ã¢â‚¬â€ DNS, front doors, latency, interception, Teams media, Copilot, VPN/proxy, and more" 
+                                   Foreground="Gray" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    
+                    <!-- Configuration -->
+                    <Grid Grid.Row="1" Margin="0,0,0,10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="350"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        
+                        <GroupBox Grid.Column="0" Header="Assessment Configuration">
+                            <StackPanel Margin="5">
+                                <TextBlock Text="Microsoft Geography:"  Margin="0,0,0,3"/>
+                                <ComboBox x:Name="cmbAssessGeo" SelectedIndex="0" Width="250" HorizontalAlignment="Left">
+                                    <ComboBoxItem Content="Worldwide (Commercial)"/>
+                                    <ComboBoxItem Content="US Gov DoD"/>
+                                    <ComboBoxItem Content="US Gov GCC High"/>
+                                    <ComboBoxItem Content="China (21Vianet)"/>
+                                    <ComboBoxItem Content="Germany"/>
+                                </ComboBox>
+                                
+                                <TextBlock Text="Tenant Domain (optional):"  Margin="0,15,0,3"/>
+                                <TextBox x:Name="txtAssessTenant" Margin="0,0,0,3"/>
+                                <TextBlock Text="e.g. contoso (for contoso.sharepoint.com)" Foreground="Gray" FontSize="10"/>
+                                
+                                <Button x:Name="btnRunAssessment" Content="Run Full Assessment" Margin="0,20,0,0" Padding="15,10" Background="#107C10" FontSize="14"/>
+                                <TextBlock x:Name="txtAssessStatus" Text="Ready" Foreground="Gray" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                                <ProgressBar x:Name="assessProgress" Height="6" Background="LightGray" Foreground="#107C10" BorderThickness="0" Margin="0,8,0,0" Minimum="0" Maximum="13" Value="0"/>
+                            </StackPanel>
+                        </GroupBox>
+                        
+                        <GroupBox Grid.Column="1" Header="What This Tests" Margin="10,0,0,0">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <TextBlock Foreground="Gray" TextWrapping="Wrap" Margin="5">
+                                    <Run FontWeight="Bold">This assessment runs all of the following tests:</Run>
+                                    <LineBreak/><LineBreak/>
+                                    <Run Foreground="#107C10">1.</Run> Network egress geolocation (public IP, ISP, city)
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">2.</Run> DNS recursive resolver identification
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">3.</Run> DNS resolution performance for key M365 endpoints
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">4.</Run> VPN and proxy server detection
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">5.</Run> Exchange, SharePoint, Teams front door identification
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">6.</Run> HTTPS endpoint connectivity (from live M365 JSON feed)
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">7.</Run> SSL/TLS interception detection
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">8.</Run> Teams UDP media port connectivity (3478-3481)
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">9.</Run> Teams jitter, latency, and packet loss
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">10.</Run> SharePoint download speed and buffer bloat
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">11.</Run> Traceroutes to service front doors
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">12.</Run> Microsoft 365 Copilot and WebSocket connectivity
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">13.</Run> TCP/TLS negotiation analysis
+                                    <LineBreak/><LineBreak/>
+                                    <Run FontWeight="Bold">Endpoints are pulled live from the official Microsoft JSON feed for the selected geography.</Run>
+                                    <LineBreak/><LineBreak/>
+                                    A detailed text report is saved automatically to the current working directory upon completion.
+                                </TextBlock>
+                            </ScrollViewer>
+                        </GroupBox>
+                    </Grid>
+                    
+                    <!-- Results -->
+                    <GroupBox Grid.Row="2" Header="Assessment Results">
+                        <Border Background="White" CornerRadius="4" Padding="10">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <TextBlock x:Name="txtAssessResults" 
+                                            
+                                           FontFamily="Consolas" 
+                                           FontSize="12"
+                                           TextWrapping="Wrap"
+                                           Text="Click 'Run Full Assessment' to start."/>
+                            </ScrollViewer>
+                        </Border>
+                    </GroupBox>
+                </Grid>
+            </TabItem>
         </TabControl>
         
-        <!-- Progress Bar -->
-        <Grid Grid.Row="2" Margin="0,15,0,10">
-            <ProgressBar x:Name="progressBar" Height="6" Background="#3C3C3C" Foreground="#0078D4" BorderThickness="0"/>
+        <!-- Progress Bar (SSL scan) -->
+        <Grid x:Name="sslProgressBar" Grid.Row="2" Margin="0,15,0,10">
+            <ProgressBar x:Name="progressBar" Height="6" Background="LightGray" Foreground="#0078D4" BorderThickness="0"/>
         </Grid>
         
-        <!-- Bottom Controls -->
-        <Grid Grid.Row="3">
+        <!-- Bottom Controls (SSL scan) -->
+        <Grid x:Name="sslControlBar" Grid.Row="3">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
@@ -2109,7 +3657,7 @@ function Start-GUIMode {
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             
-            <TextBlock x:Name="txtStatus" Grid.Column="0" VerticalAlignment="Center" Foreground="#888888" Text="Ready to scan"/>
+            <TextBlock x:Name="txtStatus" Grid.Column="0" VerticalAlignment="Center" Foreground="Gray" Text="Ready to scan"/>
             
             <Button x:Name="btnExport" Grid.Column="1" Content="Export Results" Margin="10,0" IsEnabled="False"/>
             <Button x:Name="btnStop" Grid.Column="2" Content="Stop" Margin="0,0,10,0" Background="#C42B1C" IsEnabled="False"/>
@@ -2131,6 +3679,18 @@ function Start-GUIMode {
     }
 
     #endregion
+
+    # Hide SSL bottom bar when Assessment tab is selected
+    $mainTabControl.Add_SelectionChanged({
+        $selectedTab = $mainTabControl.SelectedItem
+        if ($selectedTab -and $selectedTab.Header -eq 'Assessment') {
+            $sslControlBar.Visibility = [System.Windows.Visibility]::Collapsed
+            $sslProgressBar.Visibility = [System.Windows.Visibility]::Collapsed
+        } else {
+            $sslControlBar.Visibility = [System.Windows.Visibility]::Visible
+            $sslProgressBar.Visibility = [System.Windows.Visibility]::Visible
+        }
+    })
 
     #region Data Collections
 
@@ -2307,40 +3867,44 @@ function Start-GUIMode {
     function Export-ResultsGUI {
         $saveDialog = New-Object Microsoft.Win32.SaveFileDialog
         $saveDialog.Filter = "Text Files (*.txt)|*.txt|CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
-        $saveDialog.FileName = "SSLInterception_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         
-        if ($saveDialog.ShowDialog() -eq $true) {
-            $output = @()
-            $output += "=" * 80
-            $output += "SSL/TLS Interception Detection Results"
-            $output += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-            $output += "Computer: $env:COMPUTERNAME"
-            $output += "User: $env:USERNAME"
-            $output += "=" * 80
-            $output += ""
+        if ($guiResultsList.Count -gt 0) {
+            # SSL scan results
+            $saveDialog.FileName = "SSLInterception_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
             
-            $output += "SUMMARY"
-            $output += "-" * 40
-            $output += "Total Tested: $($txtTotalCount.Text)"
-            $output += "Trusted: $($txtTrustedCount.Text)"
-            $output += "Intercepted: $($txtInterceptedCount.Text)"
-            $output += "Failed: $($txtFailedCount.Text)"
-            $output += ""
-            
-            $output += "DETAILED RESULTS"
-            $output += "-" * 40
-            
-            foreach ($result in $guiResultsList) {
+            if ($saveDialog.ShowDialog() -eq $true) {
+                $output = @()
+                $output += "=" * 80
+                $output += "SSL/TLS Interception Detection Results"
+                $output += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                $output += "Computer: $env:COMPUTERNAME"
+                $output += "User: $env:USERNAME"
+                $output += "=" * 80
                 $output += ""
-                $output += "$($result.StatusIcon) $($result.Description)"
-                $output += "   Hostname: $($result.Hostname):$($result.Port)"
-                $output += "   Root CA: $($result.RootCA)"
-                $output += "   Thumbprint: $($result.RootThumbprint)"
-                $output += "   Details: $($result.Details)"
+                
+                $output += "SUMMARY"
+                $output += "-" * 40
+                $output += "Total Tested: $($txtTotalCount.Text)"
+                $output += "Trusted: $($txtTrustedCount.Text)"
+                $output += "Intercepted: $($txtInterceptedCount.Text)"
+                $output += "Failed: $($txtFailedCount.Text)"
+                $output += ""
+                
+                $output += "DETAILED RESULTS"
+                $output += "-" * 40
+                
+                foreach ($result in $guiResultsList) {
+                    $output += ""
+                    $output += "$($result.StatusIcon) $($result.Description)"
+                    $output += "   Hostname: $($result.Hostname):$($result.Port)"
+                    $output += "   Root CA: $($result.RootCA)"
+                    $output += "   Thumbprint: $($result.RootThumbprint)"
+                    $output += "   Details: $($result.Details)"
+                }
+                
+                $output | Out-File -FilePath $saveDialog.FileName -Encoding UTF8
+                $txtStatus.Text = "Results exported to: $($saveDialog.FileName)"
             }
-            
-            $output | Out-File -FilePath $saveDialog.FileName -Encoding UTF8
-            $txtStatus.Text = "Results exported to: $($saveDialog.FileName)"
         }
     }
 
@@ -3023,6 +4587,50 @@ function Start-GUIMode {
         }
     })
 
+    # Assessment - Run Full Assessment button
+    $btnRunAssessment.Add_Click({
+        # Map combo box to geography key
+        $geoMap = @("Worldwide", "USGovDoD", "USGovGCCHigh", "China", "Germany")
+        $selectedGeo = $geoMap[$cmbAssessGeo.SelectedIndex]
+        $tenantDomain = $txtAssessTenant.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($tenantDomain)) { $tenantDomain = $null }
+
+        $btnRunAssessment.IsEnabled = $false
+        $txtAssessStatus.Text = "Starting assessment..."
+        $assessProgress.Value = 0
+        $txtAssessResults.Text = "Running M365 Network Connectivity Assessment...`n`nGeography: $selectedGeo`n"
+        $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+
+        try {
+            $progressCB = {
+                param([int]$Step, [int]$Total, [string]$StepName)
+                $window.Dispatcher.Invoke([Action]{
+                    $assessProgress.Value = $Step
+                    $txtAssessStatus.Text = "[$Step/$Total] $StepName"
+                    $txtAssessResults.Text = $txtAssessResults.Text + "`n[$Step/$Total] $StepName"
+                }, [System.Windows.Threading.DispatcherPriority]::Background)
+            }
+
+            $assessment = Start-NetworkAssessment -SelectedGeography $selectedGeo -TenantDomain $tenantDomain -ProgressCallback $progressCB
+
+            # Generate report
+            $report = Export-AssessmentReport -Assessment $assessment -OutputPath $OutputPath
+
+            $txtAssessResults.Text = "Report saved to: $($report.FilePath)`n`n$($report.Content)"
+            $txtAssessStatus.Foreground = [System.Windows.Media.Brushes]::Green
+            $txtAssessStatus.Text = "Assessment complete. Report saved to: $($report.FilePath)"
+            $assessProgress.Value = 13
+        }
+        catch {
+            $txtAssessResults.Text = "Error during assessment: $($_.Exception.Message)`n`n$($_.ScriptStackTrace)"
+            $txtAssessStatus.Foreground = [System.Windows.Media.Brushes]::Red
+            $txtAssessStatus.Text = "Assessment failed"
+        }
+        finally {
+            $btnRunAssessment.IsEnabled = $true
+        }
+    })
+
     # Stop button
     $btnStop.Add_Click({
         $script:guiScanCancelled = $true
@@ -3322,7 +4930,7 @@ function Start-CLIMode {
     Write-ColorOutput @"
 
 ================================================================================
-                     SSL/TLS Interception Detector
+                       Network Diagnostic Toolkit
 ================================================================================
 
 "@ "Cyan"
@@ -3542,7 +5150,33 @@ if ($DiscoverRootCAs) {
 }
 elseif ($NoGUI) {
     # NoGUI specified - run in CLI mode if tests are specified, otherwise show help
-    if ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAppleSSO -or $TestHairpin -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
+    if ($RunAssessment) {
+        # Run the network connectivity assessment
+        Write-Host ""
+        Write-Host "=================================================================================" -ForegroundColor Cyan
+        Write-Host "              Microsoft 365 Network Connectivity Assessment" -ForegroundColor Cyan
+        Write-Host "=================================================================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "Geography : $Geography" -ForegroundColor Gray
+        Write-Host "Computer  : $env:COMPUTERNAME" -ForegroundColor Gray
+        Write-Host "User      : $env:USERNAME" -ForegroundColor Gray
+        Write-Host "Date      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
+        Write-Host ""
+
+        $assessResults = Start-NetworkAssessment -SelectedGeography $Geography -ProgressCallback {
+            param($step, $total, $msg)
+            $pct = [math]::Round(($step / $total) * 100)
+            Write-Host "  [$pct%] Step $step/$total - $msg" -ForegroundColor Yellow
+        }
+
+        # Generate the report
+        $reportPath = Export-AssessmentReport -Results $assessResults -OutputFolder $OutputPath
+        Write-Host ""
+        Write-Host "Assessment complete. Report saved to:" -ForegroundColor Green
+        Write-Host "  $reportPath" -ForegroundColor White
+        Write-Host ""
+    }
+    elseif ($TestAVD -or $TestMicrosoft365 -or $TestAzure -or $TestTRv2 -or $TestAppleSSO -or $TestHairpin -or $TestAll -or $CustomEndpoints -or $FetchM365Endpoints -or $FetchAzureEndpoints) {
         if ($TestHairpin) {
             # Run hairpin test in CLI mode
             Invoke-HairpinTest -AutoDetectPublicIP
@@ -3553,8 +5187,8 @@ elseif ($NoGUI) {
     }
     else {
         Write-Host ""
-        Write-Host "SSL/TLS Interception Detector" -ForegroundColor Cyan
-        Write-Host "=============================" -ForegroundColor Cyan
+        Write-Host "Network Diagnostic Toolkit" -ForegroundColor Cyan
+        Write-Host "==========================" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "Usage:" -ForegroundColor Yellow
         Write-Host "  (no switches)        Launch graphical user interface (default)"
@@ -3573,6 +5207,10 @@ elseif ($NoGUI) {
         Write-Host "  -CustomEndpoints     Test custom endpoints (e.g., @('host:port'))"
         Write-Host "  -OutputPath          Path to save results (default: current directory)"
         Write-Host ""
+        Write-Host "  -RunAssessment       Run M365 network connectivity assessment" -ForegroundColor White
+        Write-Host "  -Geography           Geography for assessment: Worldwide (default)," -ForegroundColor White
+        Write-Host "                       USGovDoD, USGovGCCHigh, China, Germany" -ForegroundColor White
+        Write-Host ""
         Write-Host "Examples:" -ForegroundColor Yellow
         Write-Host "  .\Detect-Interception.ps1"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAll"
@@ -3580,6 +5218,8 @@ elseif ($NoGUI) {
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestAVD -FetchAzureEndpoints"
         Write-Host "  .\Detect-Interception.ps1 -DiscoverRootCAs"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestHairpin"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -RunAssessment"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -RunAssessment -Geography USGovGCCHigh"
         Write-Host ""
         Write-Host "Note: -NoGUI requires at least one test parameter to be specified." -ForegroundColor Yellow
     }
