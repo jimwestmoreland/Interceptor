@@ -120,6 +120,9 @@ param(
     [switch]$RunAssessment,
     [ValidateSet("Worldwide","USGovDoD","USGovGCCHigh","China","Germany")]
     [string]$Geography = "Worldwide",
+    [string]$OfficeCity,
+    [string]$OfficeState,
+    [string]$OfficeCountry,
     [string]$RootCAConfigPath,
     [string[]]$CustomEndpoints,
     [string]$OutputPath = $PWD.Path
@@ -1476,6 +1479,159 @@ function Get-NetworkEgressInfo {
     return $info
 }
 
+function Get-OfficeLocationCoordinates {
+    <#
+    .SYNOPSIS
+        Geocodes an office location (city, state, country) to lat/lon coordinates
+        using free geocoding APIs
+    #>
+    param(
+        [string]$City,
+        [string]$State,
+        [string]$Country
+    )
+
+    $result = [PSCustomObject]@{
+        City      = $City
+        State     = $State
+        Country   = $Country
+        Latitude  = $null
+        Longitude = $null
+        Success   = $false
+    }
+
+    $parts = @($City, $State, $Country) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($parts.Count -eq 0) { return $result }
+    $query = ($parts -join ", ")
+
+    try {
+        # Use Nominatim (OpenStreetMap) - free, no key required
+        $encoded = [System.Uri]::EscapeDataString($query)
+        $response = Invoke-RestMethod -Uri "https://nominatim.openstreetmap.org/search?q=$encoded&format=json&limit=1" -TimeoutSec 10 -Headers @{ "User-Agent" = "M365-Network-Diagnostic-Tool/1.0" } -ErrorAction Stop
+        if ($response -and $response.Count -gt 0) {
+            $result.Latitude  = [double]$response[0].lat
+            $result.Longitude = [double]$response[0].lon
+            $result.Success   = $true
+        }
+    } catch { }
+
+    return $result
+}
+
+function Get-HaversineDistance {
+    <#
+    .SYNOPSIS
+        Calculates great-circle distance in km between two lat/lon points
+    #>
+    param(
+        [double]$Lat1, [double]$Lon1,
+        [double]$Lat2, [double]$Lon2
+    )
+    $R = 6371 # Earth radius in km
+    $dLat = [math]::PI * ($Lat2 - $Lat1) / 180
+    $dLon = [math]::PI * ($Lon2 - $Lon1) / 180
+    $lat1Rad = [math]::PI * $Lat1 / 180
+    $lat2Rad = [math]::PI * $Lat2 / 180
+    $a = [math]::Sin($dLat/2) * [math]::Sin($dLat/2) + [math]::Cos($lat1Rad) * [math]::Cos($lat2Rad) * [math]::Sin($dLon/2) * [math]::Sin($dLon/2)
+    $c = 2 * [math]::Atan2([math]::Sqrt($a), [math]::Sqrt(1 - $a))
+    return [math]::Round($R * $c, 0)
+}
+
+function Get-BestFrontDoors {
+    <#
+    .SYNOPSIS
+        Compares in-use front doors against known best/closest Microsoft front door locations.
+        Tests alternate front door endpoints and reports if a closer one exists.
+    #>
+    param(
+        [array]$CurrentFrontDoors,
+        [PSCustomObject]$EgressInfo
+    )
+
+    # Known Microsoft front door regions with approximate coordinates
+    # These represent major M365 service entry points globally
+    $knownFrontDoorRegions = @(
+        @{ Name = "US East";        City = "Ashburn, VA";         Lat = 39.0438; Lon = -77.4874 }
+        @{ Name = "US Central";     City = "Des Moines, IA";      Lat = 41.5868; Lon = -93.6250 }
+        @{ Name = "US West";        City = "Quincy, WA";          Lat = 47.2343; Lon = -119.8526 }
+        @{ Name = "US South";       City = "San Antonio, TX";     Lat = 29.4241; Lon = -98.4936 }
+        @{ Name = "Canada East";    City = "Quebec City, QC";     Lat = 46.8139; Lon = -71.2080 }
+        @{ Name = "Canada Central"; City = "Toronto, ON";         Lat = 43.6532; Lon = -79.3832 }
+        @{ Name = "UK South";       City = "London, UK";          Lat = 51.5074; Lon = -0.1278 }
+        @{ Name = "Europe West";    City = "Amsterdam, NL";       Lat = 52.3676; Lon = 4.9041 }
+        @{ Name = "Europe North";   City = "Dublin, IE";          Lat = 53.3498; Lon = -6.2603 }
+        @{ Name = "France Central"; City = "Paris, FR";           Lat = 48.8566; Lon = 2.3522 }
+        @{ Name = "Germany West";   City = "Frankfurt, DE";       Lat = 50.1109; Lon = 8.6821 }
+        @{ Name = "Asia East";      City = "Hong Kong";           Lat = 22.3193; Lon = 114.1694 }
+        @{ Name = "Asia Southeast"; City = "Singapore";           Lat = 1.3521; Lon = 103.8198 }
+        @{ Name = "Japan East";     City = "Tokyo, JP";           Lat = 35.6762; Lon = 139.6503 }
+        @{ Name = "Australia East"; City = "Sydney, AU";          Lat = -33.8688; Lon = 151.2093 }
+        @{ Name = "India Central";  City = "Pune, IN";            Lat = 18.5204; Lon = 73.8567 }
+        @{ Name = "Brazil South";   City = "Sao Paulo, BR";       Lat = -23.5505; Lon = -46.6333 }
+        @{ Name = "South Africa";   City = "Johannesburg, ZA";   Lat = -26.2041; Lon = 28.0473 }
+        @{ Name = "Korea Central";  City = "Seoul, KR";          Lat = 37.5665; Lon = 126.9780 }
+        @{ Name = "UAE North";      City = "Dubai, AE";          Lat = 25.2048; Lon = 55.2708 }
+    )
+
+    $results = @()
+
+    if (-not $EgressInfo -or -not $EgressInfo.Success -or -not $EgressInfo.Latitude) {
+        return $results
+    }
+
+    # Find the closest known front door region to the user's egress point
+    $closestRegion = $null
+    $closestDist = [double]::MaxValue
+    foreach ($region in $knownFrontDoorRegions) {
+        $dist = Get-HaversineDistance -Lat1 $EgressInfo.Latitude -Lon1 $EgressInfo.Longitude -Lat2 $region.Lat -Lon2 $region.Lon
+        if ($dist -lt $closestDist) {
+            $closestDist = $dist
+            $closestRegion = $region
+        }
+    }
+
+    # For each current front door, geolocate it and compare to the best possible
+    foreach ($fd in ($CurrentFrontDoors | Where-Object { $_.Success })) {
+        $fdLat = $null; $fdLon = $null; $fdCity = "Unknown"
+        if ($fd.FrontDoorIP -and $fd.FrontDoorIP -ne "N/A") {
+            try {
+                $fdGeo = Invoke-RestMethod -Uri "http://ip-api.com/json/$($fd.FrontDoorIP)?fields=status,city,regionName,country,lat,lon" -TimeoutSec 5 -ErrorAction Stop
+                if ($fdGeo.status -eq "success" -and $fdGeo.lat) {
+                    $fdLat = $fdGeo.lat; $fdLon = $fdGeo.lon
+                    $fdCity = "$($fdGeo.city), $($fdGeo.regionName), $($fdGeo.country)"
+                }
+                Start-Sleep -Milliseconds 500  # Rate limit ip-api.com
+            } catch { }
+        }
+
+        $fdDistFromEgress = $null
+        if ($fdLat) {
+            $fdDistFromEgress = Get-HaversineDistance -Lat1 $EgressInfo.Latitude -Lon1 $EgressInfo.Longitude -Lat2 $fdLat -Lon2 $fdLon
+        }
+
+        $isOptimal = $false
+        if ($fdDistFromEgress -ne $null -and $closestDist -ne $null) {
+            # If in-use front door is within 200km of the best possible, consider it optimal
+            $isOptimal = ($fdDistFromEgress -le ($closestDist + 200))
+        }
+
+        $results += [PSCustomObject]@{
+            Service            = $fd.Service
+            InUseFrontDoor     = $fd.FrontDoorCNAME
+            InUseFrontDoorIP   = $fd.FrontDoorIP
+            InUseLocation      = $fdCity
+            InUseDistanceKm    = $fdDistFromEgress
+            BestRegion         = $closestRegion.Name
+            BestRegionCity     = $closestRegion.City
+            BestRegionDistKm   = $closestDist
+            IsOptimal          = $isOptimal
+            TCPLatencyMs       = $fd.TCPLatencyMs
+        }
+    }
+
+    return $results
+}
+
 function Get-ServiceFrontDoor {
     <#
     .SYNOPSIS
@@ -1737,19 +1893,20 @@ function Test-HTTPConnectivity {
 function Test-VPNAndProxy {
     <#
     .SYNOPSIS
-        Detects VPN connections and proxy configuration
+        Detects VPN connections, proxy configuration, and per-workload split tunnel routing
     #>
     $result = [PSCustomObject]@{
-        VPNDetected      = $false
-        VPNAdapterName   = $null
-        VPNType          = $null
-        ProxyEnabled     = $false
-        ProxyServer      = $null
-        ProxyPACUrl      = $null
-        WinHTTPProxy     = $null
-        EnvProxy         = $null
-        SplitTunnelStatus = "Unknown"
-        Details          = @()
+        VPNDetected        = $false
+        VPNAdapterName     = $null
+        VPNType            = $null
+        ProxyEnabled       = $false
+        ProxyServer        = $null
+        ProxyPACUrl        = $null
+        WinHTTPProxy       = $null
+        EnvProxy           = $null
+        SplitTunnelStatus  = "Unknown"
+        SplitTunnelDetails = @()
+        Details            = @()
     }
 
     # Check for VPN adapters
@@ -1791,6 +1948,52 @@ function Test-VPNAndProxy {
             }
         }
     } catch { }
+
+    # Per-workload split tunnel test (Microsoft 365 Optimize category endpoints)
+    # These are the key IPs that Microsoft recommends be split-tunneled
+    if ($result.VPNDetected) {
+        $optimizeEndpoints = @(
+            @{ Workload = "Exchange Online"; TestHost = "outlook.office365.com"; TestIP = "13.107.6.152"; Ports = "TCP 443" }
+            @{ Workload = "SharePoint Online"; TestHost = "microsoft.sharepoint.com"; TestIP = "13.107.136.1"; Ports = "TCP 443" }
+            @{ Workload = "Microsoft Teams"; TestHost = "13.107.64.1"; TestIP = "13.107.64.1"; Ports = "UDP 3478-3481" }
+        )
+
+        foreach ($ep in $optimizeEndpoints) {
+            $splitResult = [PSCustomObject]@{
+                Workload      = $ep.Workload
+                TestIP        = $ep.TestIP
+                Ports         = $ep.Ports
+                RouteAdapter  = "Unknown"
+                RoutesViaVPN  = $null
+                Rating        = "Unknown"
+            }
+
+            try {
+                # Use Find-NetRoute to determine which adapter would route to this IP
+                $route = Find-NetRoute -RemoteIPAddress $ep.TestIP -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($route) {
+                    $routeAdapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue
+                    if ($routeAdapter) {
+                        $splitResult.RouteAdapter = "$($routeAdapter.Name) ($($routeAdapter.InterfaceDescription))"
+                        $isVPN = $routeAdapter.InterfaceDescription -match "VPN|Virtual|Tunnel|TAP|WireGuard|Cisco|Palo Alto|Zscaler|GlobalProtect|AnyConnect|Fortinet|Juniper|Pulse"
+                        $isVPN = $isVPN -or ($routeAdapter.Name -eq $result.VPNAdapterName)
+                        $splitResult.RoutesViaVPN = $isVPN
+                        $splitResult.Rating = if ($isVPN) { "Not Optimized - routes through VPN" } else { "Optimized - direct internet egress" }
+                    }
+                }
+            } catch { }
+
+            $result.SplitTunnelDetails += $splitResult
+        }
+
+        # Summarize
+        $vpnRouted = @($result.SplitTunnelDetails | Where-Object { $_.RoutesViaVPN -eq $true })
+        if ($vpnRouted.Count -gt 0) {
+            $result.Details += "$($vpnRouted.Count) Optimize workload(s) routing through VPN (should be split-tunneled)"
+        } else {
+            $result.Details += "All Optimize workloads appear to use direct internet egress"
+        }
+    }
 
     # Check IE/System proxy settings
     try {
@@ -1915,22 +2118,26 @@ function Test-TeamsUDPConnectivity {
 function Test-SharePointDownloadSpeed {
     <#
     .SYNOPSIS
-        Tests download speed and buffer bloat to SharePoint front door
+        Tests download speed and buffer bloat using a meaningful download (~10MB).
+        Uses speed.cloudflare.com test endpoint for consistent, CDN-backed measurement.
+        Falls back to smaller download if the large test times out.
     #>
     param(
-        [string]$TestUrl = "https://www.microsoft.com/favicon.ico",
         [string]$SharePointHost = "microsoft.sharepoint.com",
-        [int]$Port = 443
+        [int]$Port = 443,
+        [int]$DownloadBytes = 10000000
     )
 
     $result = [PSCustomObject]@{
-        DownloadSpeedMBps = 0
+        SpeedMegabitsPerSec  = 0
+        SpeedMegabytesPerSec = 0
         DownloadSizeBytes = 0
         DownloadTimeMs    = 0
         LatencyBeforeMs   = 0
         LatencyDuringMs   = 0
         BufferBloatMs     = 0
         BufferBloatRating = "N/A"
+        TestSource        = $null
         Success           = $false
         Error             = $null
     }
@@ -1940,20 +2147,36 @@ function Test-SharePointDownloadSpeed {
         $preLatency = Measure-TCPLatency -Hostname $SharePointHost -Port $Port -Count 5
         $result.LatencyBeforeMs = $preLatency.AvgMs
 
-        # Download a test file
+        # Download test payload from Cloudflare speed test (widely available, CDN-backed)
+        $testUrl = "https://speed.cloudflare.com/__down?bytes=$DownloadBytes"
+        $result.TestSource = "speed.cloudflare.com ($([math]::Round($DownloadBytes / 1MB, 1)) MB)"
+
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $webClient = New-Object System.Net.WebClient
-        $data = $webClient.DownloadData($TestUrl)
-        $sw.Stop()
+        try {
+            $webClient = New-Object System.Net.WebClient
+            $data = $webClient.DownloadData($testUrl)
+            $sw.Stop()
+        } catch {
+            # Fallback to smaller Microsoft favicon if Cloudflare blocked
+            $sw.Stop()
+            $testUrl = "https://www.microsoft.com/favicon.ico"
+            $result.TestSource = "microsoft.com/favicon.ico (fallback)"
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $webClient = New-Object System.Net.WebClient
+            $data = $webClient.DownloadData($testUrl)
+            $sw.Stop()
+        }
 
         $result.DownloadSizeBytes = $data.Length
         $result.DownloadTimeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
 
         if ($sw.Elapsed.TotalSeconds -gt 0) {
-            $result.DownloadSpeedMBps = [math]::Round(($data.Length / 1MB) / $sw.Elapsed.TotalSeconds, 3)
+            $speedMBps = ($data.Length / 1MB) / $sw.Elapsed.TotalSeconds
+            $result.SpeedMegabytesPerSec = [math]::Round($speedMBps, 3)
+            $result.SpeedMegabitsPerSec = [math]::Round($speedMBps * 8, 2)
         }
 
-        # Measure latency during/after download (to detect buffer bloat)
+        # Measure latency after download (to detect buffer bloat)
         $postLatency = Measure-TCPLatency -Hostname $SharePointHost -Port $Port -Count 5
         $result.LatencyDuringMs = $postLatency.AvgMs
 
@@ -2307,6 +2530,9 @@ function Start-NetworkAssessment {
     param(
         [string]$SelectedGeography = "Worldwide",
         [string]$TenantDomain,
+        [string]$OfficeCity,
+        [string]$OfficeState,
+        [string]$OfficeCountry,
         [scriptblock]$ProgressCallback
     )
 
@@ -2316,10 +2542,13 @@ function Start-NetworkAssessment {
         UserName           = $env:USERNAME
         Geography          = $SelectedGeography
         TenantDomain       = $TenantDomain
+        OfficeLocation     = $null
         NetworkEgress      = $null
+        EgressDistance      = $null
         DNSPerformance     = $null
         DNSResolver        = $null
         ServiceFrontDoors  = $null
+        BestFrontDoors     = $null
         HTTPConnectivity   = $null
         SSLInterception    = $null
         VPNProxy           = $null
@@ -2348,6 +2577,20 @@ function Start-NetworkAssessment {
     & $reportProgress "Detecting network egress location..."
     $assessmentResults.NetworkEgress = Get-NetworkEgressInfo
 
+    # Geocode office location if provided, then calculate distance to egress
+    if ($OfficeCity -or $OfficeState -or $OfficeCountry) {
+        $officeGeo = Get-OfficeLocationCoordinates -City $OfficeCity -State $OfficeState -Country $OfficeCountry
+        $assessmentResults.OfficeLocation = $officeGeo
+        if ($officeGeo.Success -and $assessmentResults.NetworkEgress.Success -and $assessmentResults.NetworkEgress.Latitude) {
+            $distKm = Get-HaversineDistance -Lat1 $officeGeo.Latitude -Lon1 $officeGeo.Longitude -Lat2 $assessmentResults.NetworkEgress.Latitude -Lon2 $assessmentResults.NetworkEgress.Longitude
+            $assessmentResults.EgressDistance = [PSCustomObject]@{
+                DistanceKm = $distKm
+                DistanceMi = [math]::Round($distKm * 0.621371, 0)
+                Rating     = if ($distKm -lt 100) { "Optimal" } elseif ($distKm -lt 500) { "Good" } elseif ($distKm -lt 800) { "Acceptable" } else { "Poor - significant WAN backhaul likely" }
+            }
+        }
+    }
+
     # Step 2: DNS Resolver
     & $reportProgress "Identifying DNS recursive resolver..."
     $assessmentResults.DNSResolver = Get-DNSRecursiveResolver
@@ -2363,6 +2606,8 @@ function Start-NetworkAssessment {
     # Step 5: Service Front Doors
     & $reportProgress "Identifying service front doors..."
     $assessmentResults.ServiceFrontDoors = Get-ServiceFrontDoor -TenantDomain $TenantDomain
+    # Compare against best possible front doors
+    $assessmentResults.BestFrontDoors = Get-BestFrontDoors -CurrentFrontDoors $assessmentResults.ServiceFrontDoors -EgressInfo $assessmentResults.NetworkEgress
 
     # Step 6: Fetch and test HTTP connectivity with live endpoints
     & $reportProgress "Fetching endpoints and testing HTTP connectivity..."
@@ -2470,6 +2715,34 @@ function Export-AssessmentReport {
     }
     [void]$sb.AppendLine("")
 
+    # ---- Office Location & Egress Distance ----
+    if ($Assessment.OfficeLocation -and $Assessment.OfficeLocation.Success) {
+        [void]$sb.AppendLine("-" * 80)
+        [void]$sb.AppendLine("  OFFICE LOCATION AND EGRESS DISTANCE")
+        [void]$sb.AppendLine("-" * 80)
+        $ol = $Assessment.OfficeLocation
+        [void]$sb.AppendLine("  Office Location:  $($ol.DisplayName)")
+        [void]$sb.AppendLine("  Coordinates:      $($ol.Latitude), $($ol.Longitude)")
+        if ($Assessment.EgressDistance) {
+            $ed = $Assessment.EgressDistance
+            [void]$sb.AppendLine("  Egress Location:  $($egress.City), $($egress.Region), $($egress.Country)")
+            [void]$sb.AppendLine("  Distance:         ~$($ed.DistanceKm) km (~$($ed.DistanceMi) mi)")
+            [void]$sb.AppendLine("  Rating:           $($ed.Rating)")
+            [void]$sb.AppendLine("")
+            if ($ed.DistanceKm -ge 800) {
+                [void]$sb.AppendLine("  [!] Your internet traffic exits $($ed.DistanceKm) km from your office. This suggests")
+                [void]$sb.AppendLine("      WAN backhaul to a remote egress point. For best M365 performance,")
+                [void]$sb.AppendLine("      configure local internet breakout at or near each office location.")
+            } elseif ($ed.DistanceKm -ge 500) {
+                [void]$sb.AppendLine("  [~] Moderate distance between office and internet egress. Consider local")
+                [void]$sb.AppendLine("      internet breakout to reduce latency to Microsoft front doors.")
+            } else {
+                [void]$sb.AppendLine("  [OK] Internet egress is near your office location.")
+            }
+        }
+        [void]$sb.AppendLine("")
+    }
+
     # ---- DNS ----
     [void]$sb.AppendLine("-" * 80)
     [void]$sb.AppendLine("  DNS PERFORMANCE")
@@ -2505,6 +2778,20 @@ function Export-AssessmentReport {
     }
     if ($vpn.VPNDetected) {
         [void]$sb.AppendLine("  Split Tunnel: $($vpn.SplitTunnelStatus)")
+        # Per-workload routing details
+        if ($vpn.SplitTunnelDetails -and $vpn.SplitTunnelDetails.Count -gt 0) {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("  Per-workload M365 Optimize Route Analysis:")
+            [void]$sb.AppendLine("  Microsoft recommends M365 Optimize category traffic bypass VPN for")
+            [void]$sb.AppendLine("  lowest latency. See: https://aka.ms/o365splitvpn")
+            [void]$sb.AppendLine("")
+            foreach ($std in $vpn.SplitTunnelDetails) {
+                $icon = if ($std.RoutesViaVPN -eq $true) { "[!]" } elseif ($std.RoutesViaVPN -eq $false) { "[OK]" } else { "[?]" }
+                [void]$sb.AppendLine("    $icon $($std.Workload) ($($std.TestIP) / $($std.Ports))")
+                [void]$sb.AppendLine("        Route Adapter: $($std.RouteAdapter)")
+                [void]$sb.AppendLine("        $($std.Rating)")
+            }
+        }
     }
     [void]$sb.AppendLine("")
 
@@ -2527,6 +2814,30 @@ function Export-AssessmentReport {
         [void]$sb.AppendLine("      TCP Latency: $($fd.TCPLatencyMs)ms (min: $($fd.MinLatencyMs)ms, max: $($fd.MaxLatencyMs)ms)  [$latencyRating]")
         if ($fd.Error) { [void]$sb.AppendLine("      Error: $($fd.Error)") }
         [void]$sb.AppendLine("")
+    }
+
+    # ---- Best Front Door Comparison ----
+    if ($Assessment.BestFrontDoors -and $Assessment.BestFrontDoors.Count -gt 0) {
+        [void]$sb.AppendLine("-" * 80)
+        [void]$sb.AppendLine("  BEST FRONT DOOR COMPARISON")
+        [void]$sb.AppendLine("-" * 80)
+        [void]$sb.AppendLine("  Compares your current Microsoft 365 front doors against the nearest known")
+        [void]$sb.AppendLine("  Microsoft front door regions based on your network egress location.")
+        [void]$sb.AppendLine("")
+        foreach ($bfd in $Assessment.BestFrontDoors) {
+            $statusIcon = if ($bfd.IsOptimal) { "[OK]" } else { "[!]" }
+            [void]$sb.AppendLine("  $statusIcon $($bfd.Service)")
+            [void]$sb.AppendLine("      Current Front Door:   $($bfd.CurrentFrontDoorIP)")
+            if ($bfd.CurrentLocation) {
+                [void]$sb.AppendLine("      Front Door Location:  $($bfd.CurrentLocation)")
+            }
+            if ($bfd.DistanceToFrontDoor) {
+                [void]$sb.AppendLine("      Distance to Current:  ~$($bfd.DistanceToFrontDoor) km")
+            }
+            [void]$sb.AppendLine("      Nearest MS Region:    $($bfd.NearestRegion) (~$($bfd.NearestRegionDistance) km)")
+            [void]$sb.AppendLine("      Assessment:           $($bfd.Rating)")
+            [void]$sb.AppendLine("")
+        }
     }
 
     # ---- Location-Aware Analysis ----
@@ -2737,12 +3048,13 @@ function Export-AssessmentReport {
     [void]$sb.AppendLine("-" * 80)
     $sp = $Assessment.SharePointSpeed
     if ($sp.Success) {
-        $speedRating = if ($sp.DownloadSpeedMBps -ge 5) { "Excellent" }
-                       elseif ($sp.DownloadSpeedMBps -ge 1) { "Good" }
-                       elseif ($sp.DownloadSpeedMBps -ge 0.5) { "Acceptable" }
+        $speedRating = if ($sp.SpeedMegabitsPerSec -ge 50) { "Excellent" }
+                       elseif ($sp.SpeedMegabitsPerSec -ge 10) { "Good" }
+                       elseif ($sp.SpeedMegabitsPerSec -ge 2) { "Acceptable" }
                        else { "Poor" }
-        [void]$sb.AppendLine("  Download Speed:     $($sp.DownloadSpeedMBps) MB/s  [$speedRating]")
-        [void]$sb.AppendLine("  Download Size:      $($sp.DownloadSizeBytes) bytes in $($sp.DownloadTimeMs)ms")
+        [void]$sb.AppendLine("  Download Speed:     $($sp.SpeedMegabitsPerSec) Mbps ($($sp.SpeedMegabytesPerSec) MB/s)  [$speedRating]")
+        [void]$sb.AppendLine("  Download Size:      $([math]::Round($sp.DownloadSizeBytes / 1MB, 2)) MB ($($sp.DownloadSizeBytes) bytes) in $($sp.DownloadTimeMs)ms")
+        if ($sp.TestSource) { [void]$sb.AppendLine("  Test Source:        $($sp.TestSource)") }
         [void]$sb.AppendLine("  Latency (idle):     $($sp.LatencyBeforeMs)ms")
         [void]$sb.AppendLine("  Latency (loaded):   $($sp.LatencyDuringMs)ms")
         [void]$sb.AppendLine("  Buffer Bloat:       $($sp.BufferBloatMs)ms - $($sp.BufferBloatRating)")
@@ -2839,6 +3151,24 @@ function Export-AssessmentReport {
     # Check for suboptimal front door distance
     foreach ($fd in ($Assessment.ServiceFrontDoors | Where-Object { $_.Success -and $_.TCPLatencyMs -gt 100 })) {
         $issues += "[WARNING] $($fd.Service) front door latency ($($fd.TCPLatencyMs)ms) exceeds 100ms - may indicate suboptimal routing"
+    }
+    # Check egress distance from office
+    if ($Assessment.EgressDistance -and $Assessment.EgressDistance.DistanceKm -ge 800) {
+        $issues += "[WARNING] Internet egress is ~$($Assessment.EgressDistance.DistanceKm) km from office - likely WAN backhaul"
+    }
+    # Check best front door comparison
+    if ($Assessment.BestFrontDoors) {
+        foreach ($bfd in ($Assessment.BestFrontDoors | Where-Object { -not $_.IsOptimal })) {
+            $issues += "[WARNING] $($bfd.Service) front door is not optimal - nearest MS region: $($bfd.NearestRegion)"
+        }
+    }
+    # Check per-workload VPN split tunnel
+    if ($Assessment.VPNProxy.SplitTunnelDetails) {
+        $vpnRouted = @($Assessment.VPNProxy.SplitTunnelDetails | Where-Object { $_.RoutesViaVPN -eq $true })
+        if ($vpnRouted.Count -gt 0) {
+            $workloads = ($vpnRouted | ForEach-Object { $_.Workload }) -join ", "
+            $issues += "[WARNING] M365 Optimize traffic for $workloads routes through VPN (split tunnel recommended)"
+        }
     }
 
     if ($issues.Count -eq 0) {
@@ -3581,6 +3911,32 @@ function Start-GUIMode {
                                 <TextBox x:Name="txtAssessTenant" Margin="0,0,0,3"/>
                                 <TextBlock Text="e.g. contoso (for contoso.sharepoint.com)" Foreground="Gray" FontSize="10"/>
                                 
+                                <TextBlock Text="Office Location (optional):"  Margin="0,15,0,3"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="5"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="5"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="txtAssessCity" Grid.Column="0"/>
+                                    <TextBox x:Name="txtAssessState" Grid.Column="2"/>
+                                    <TextBox x:Name="txtAssessCountry" Grid.Column="4"/>
+                                </Grid>
+                                <Grid Margin="0,2,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="5"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="5"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="City" Foreground="Gray" FontSize="10"/>
+                                    <TextBlock Grid.Column="2" Text="State/Region" Foreground="Gray" FontSize="10"/>
+                                    <TextBlock Grid.Column="4" Text="Country" Foreground="Gray" FontSize="10"/>
+                                </Grid>
+                                
                                 <Button x:Name="btnRunAssessment" Content="Run Full Assessment" Margin="0,20,0,0" Padding="15,10" Background="#107C10" FontSize="14"/>
                                 <TextBlock x:Name="txtAssessStatus" Text="Ready" Foreground="Gray" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
                                 <ProgressBar x:Name="assessProgress" Height="6" Background="LightGray" Foreground="#107C10" BorderThickness="0" Margin="0,8,0,0" Minimum="0" Maximum="13" Value="0"/>
@@ -3594,29 +3950,33 @@ function Start-GUIMode {
                                     <LineBreak/><LineBreak/>
                                     <Run Foreground="#107C10">1.</Run> Network egress geolocation (public IP, ISP, city)
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">2.</Run> DNS recursive resolver identification
+                                    <Run Foreground="#107C10">2.</Run> Office location geocoding and egress distance calculation
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">3.</Run> DNS resolution performance for key M365 endpoints
+                                    <Run Foreground="#107C10">3.</Run> DNS recursive resolver identification
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">4.</Run> VPN and proxy server detection
+                                    <Run Foreground="#107C10">4.</Run> DNS resolution performance for key M365 endpoints
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">5.</Run> Exchange, SharePoint, Teams front door identification
+                                    <Run Foreground="#107C10">5.</Run> VPN/proxy detection with per-workload split tunnel routing
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">6.</Run> HTTPS endpoint connectivity (from live M365 JSON feed)
+                                    <Run Foreground="#107C10">6.</Run> Exchange, SharePoint, Teams front door identification
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">7.</Run> SSL/TLS interception detection
+                                    <Run Foreground="#107C10">7.</Run> Best front door comparison (nearest Microsoft region)
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">8.</Run> Teams UDP media port connectivity (3478-3481)
+                                    <Run Foreground="#107C10">8.</Run> HTTPS endpoint connectivity (from live M365 JSON feed)
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">9.</Run> Teams jitter, latency, and packet loss
+                                    <Run Foreground="#107C10">9.</Run> SSL/TLS interception detection
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">10.</Run> SharePoint download speed and buffer bloat
+                                    <Run Foreground="#107C10">10.</Run> Teams UDP media port connectivity (3478-3481)
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">11.</Run> Traceroutes to service front doors
+                                    <Run Foreground="#107C10">11.</Run> Teams jitter, latency, and packet loss
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">12.</Run> Microsoft 365 Copilot and WebSocket connectivity
+                                    <Run Foreground="#107C10">12.</Run> Download speed test (~10 MB) and buffer bloat
                                     <LineBreak/>
-                                    <Run Foreground="#107C10">13.</Run> TCP/TLS negotiation analysis
+                                    <Run Foreground="#107C10">13.</Run> Traceroutes to service front doors
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">14.</Run> Microsoft 365 Copilot and WebSocket connectivity
+                                    <LineBreak/>
+                                    <Run Foreground="#107C10">15.</Run> TCP/TLS negotiation analysis
                                     <LineBreak/><LineBreak/>
                                     <Run FontWeight="Bold">Endpoints are pulled live from the official Microsoft JSON feed for the selected geography.</Run>
                                     <LineBreak/><LineBreak/>
@@ -4611,7 +4971,7 @@ function Start-GUIMode {
                 }, [System.Windows.Threading.DispatcherPriority]::Background)
             }
 
-            $assessment = Start-NetworkAssessment -SelectedGeography $selectedGeo -TenantDomain $tenantDomain -ProgressCallback $progressCB
+            $assessment = Start-NetworkAssessment -SelectedGeography $selectedGeo -TenantDomain $tenantDomain -OfficeCity $txtAssessCity.Text.Trim() -OfficeState $txtAssessState.Text.Trim() -OfficeCountry $txtAssessCountry.Text.Trim() -ProgressCallback $progressCB
 
             # Generate report
             $report = Export-AssessmentReport -Assessment $assessment -OutputPath $OutputPath
@@ -5161,9 +5521,13 @@ elseif ($NoGUI) {
         Write-Host "Computer  : $env:COMPUTERNAME" -ForegroundColor Gray
         Write-Host "User      : $env:USERNAME" -ForegroundColor Gray
         Write-Host "Date      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
+        if ($OfficeCity -or $OfficeState -or $OfficeCountry) {
+            $officeParts = @($OfficeCity, $OfficeState, $OfficeCountry) | Where-Object { $_ }
+            Write-Host "Office    : $($officeParts -join ', ')" -ForegroundColor Gray
+        }
         Write-Host ""
 
-        $assessResults = Start-NetworkAssessment -SelectedGeography $Geography -ProgressCallback {
+        $assessResults = Start-NetworkAssessment -SelectedGeography $Geography -OfficeCity $OfficeCity -OfficeState $OfficeState -OfficeCountry $OfficeCountry -ProgressCallback {
             param($step, $total, $msg)
             $pct = [math]::Round(($step / $total) * 100)
             Write-Host "  [$pct%] Step $step/$total - $msg" -ForegroundColor Yellow
@@ -5210,6 +5574,9 @@ elseif ($NoGUI) {
         Write-Host "  -RunAssessment       Run M365 network connectivity assessment" -ForegroundColor White
         Write-Host "  -Geography           Geography for assessment: Worldwide (default)," -ForegroundColor White
         Write-Host "                       USGovDoD, USGovGCCHigh, China, Germany" -ForegroundColor White
+        Write-Host "  -OfficeCity          Office city for egress distance calculation" -ForegroundColor White
+        Write-Host "  -OfficeState         Office state/region for egress distance calculation" -ForegroundColor White
+        Write-Host "  -OfficeCountry       Office country for egress distance calculation" -ForegroundColor White
         Write-Host ""
         Write-Host "Examples:" -ForegroundColor Yellow
         Write-Host "  .\Detect-Interception.ps1"
@@ -5220,6 +5587,7 @@ elseif ($NoGUI) {
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -TestHairpin"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -RunAssessment"
         Write-Host "  .\Detect-Interception.ps1 -NoGUI -RunAssessment -Geography USGovGCCHigh"
+        Write-Host "  .\Detect-Interception.ps1 -NoGUI -RunAssessment -OfficeCity Seattle -OfficeState WA -OfficeCountry US"
         Write-Host ""
         Write-Host "Note: -NoGUI requires at least one test parameter to be specified." -ForegroundColor Yellow
     }
