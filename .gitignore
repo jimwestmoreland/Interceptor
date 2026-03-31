@@ -3,3 +3,6 @@ archive/
 
 # Text files
 *.txt
+
+# PDF files
+*.pdf
